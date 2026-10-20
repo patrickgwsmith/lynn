@@ -1,14 +1,14 @@
 [package]
-name = "euka-shell"
+name = "lynn"
 version = "0.1.1"
 edition = "2021"
 description = "A small shared shell for humans and coding agents"
 license = "Apache-2.0"
-repository = "https://github.com/patrickgwsmith/euka"
+repository = "https://github.com/patrickgwsmith/lynn"
 readme = "README.md"
 
 [[bin]]
-name = "euka"
+name = "lynn"
 path = "src/main.rs"
 
 [dependencies]

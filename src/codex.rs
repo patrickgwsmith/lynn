@@ -1,10 +1,10 @@
-use crate::agent_cli::{self, AgentUser, Request};
+use crate::agent_cli::{self, request_for_access, AgentReply, AgentUser, ModelInfo, Request};
 use crate::session::{AgentAccess, ReasoningEffort};
 use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
 use std::path::Path;
 use std::process::{Command, Stdio};
 
-pub fn run(request: Request<'_>) -> Result<String, String> {
+pub fn run(request: Request<'_>) -> Result<AgentReply, String> {
     let Request {
         task,
         cwd,
@@ -16,7 +16,17 @@ pub fn run(request: Request<'_>) -> Result<String, String> {
     } = request;
     let args = exec_args(model, access, effort);
     let request = request_for_access(task, access);
-    agent_cli::run("codex", &args, &request, cwd, context, user, access)
+    agent_cli::run("codex", &args, &request, cwd, context, user, access).map(|text| AgentReply {
+        text,
+        model_info: Some(codex_model_info(model)),
+    })
+}
+
+fn codex_model_info(model: Option<&str>) -> ModelInfo {
+    match model {
+        Some(model) => ModelInfo::Requested(model.to_owned()),
+        None => ModelInfo::Unreported,
+    }
 }
 
 fn exec_args(model: Option<&str>, access: AgentAccess, effort: ReasoningEffort) -> Vec<&str> {
@@ -45,7 +55,10 @@ fn exec_args(model: Option<&str>, access: AgentAccess, effort: ReasoningEffort) 
     args
 }
 
-pub fn run_live(request: Request<'_>, mut progress: impl FnMut(String)) -> Result<String, String> {
+pub fn run_live(
+    request: Request<'_>,
+    mut progress: impl FnMut(String),
+) -> Result<AgentReply, String> {
     let Request {
         task,
         cwd,
@@ -128,6 +141,10 @@ pub fn run_live(request: Request<'_>, mut progress: impl FnMut(String)) -> Resul
     }
     answer
         .filter(|text| !text.trim().is_empty())
+        .map(|text| AgentReply {
+            text,
+            model_info: Some(codex_model_info(model)),
+        })
         .ok_or_else(|| "codex returned no answer".to_owned())
 }
 
@@ -185,13 +202,6 @@ pub fn interactive(
     }
     command.current_dir(cwd);
     Ok(command)
-}
-
-fn request_for_access(task: &str, access: AgentAccess) -> String {
-    match access {
-        AgentAccess::ReadOnly => format!("{task}\n\n{}", agent_cli::READ_ONLY_REPLY_INSTRUCTION),
-        AgentAccess::ReadWrite => task.to_owned(),
-    }
 }
 
 #[cfg(test)]

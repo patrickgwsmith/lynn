@@ -1,13 +1,13 @@
-use crate::agent_cli::{self, AgentUser, Request};
+use crate::agent_cli::{self, AgentReply, AgentUser, ModelInfo, Request};
 use crate::session::{AgentAccess, ReasoningEffort};
 use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-const PROMPT: &str = "Answer the Euka user request supplied on stdin. Use the Euka session context and inspect project files as needed.";
+const PROMPT: &str = "Answer the Lynn user request supplied on stdin. Use the Lynn session context and inspect project files as needed.";
 
-pub fn run(request: Request<'_>) -> Result<String, String> {
+pub fn run(request: Request<'_>) -> Result<AgentReply, String> {
     let Request {
         task,
         cwd,
@@ -19,8 +19,9 @@ pub fn run(request: Request<'_>) -> Result<String, String> {
     } = request;
     let mut command = request_command(cwd, model, access, user, effort)?;
     command.args(["--output-format", "json"]);
+    let task = agent_cli::request_for_access(task, access);
     let output =
-        agent_cli::run_with_input(command, "claude", agent_cli::session_input(context, task))?;
+        agent_cli::run_with_input(command, "claude", agent_cli::session_input(context, &task))?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(format!("claude {}: {}", output.status, stderr.trim()));
@@ -74,7 +75,10 @@ fn request_command(
     Ok(command)
 }
 
-pub fn run_live(request: Request<'_>, mut progress: impl FnMut(String)) -> Result<String, String> {
+pub fn run_live(
+    request: Request<'_>,
+    mut progress: impl FnMut(String),
+) -> Result<AgentReply, String> {
     let Request {
         task,
         cwd,
@@ -98,7 +102,8 @@ pub fn run_live(request: Request<'_>, mut progress: impl FnMut(String)) -> Resul
         .spawn()
         .map_err(|error| format!("claude: {error}"))?;
     let mut stdin = child.stdin.take().ok_or("claude stdin unavailable")?;
-    let input = agent_cli::session_input(context, task);
+    let task = agent_cli::request_for_access(task, access);
+    let input = agent_cli::session_input(context, &task);
     let writer = std::thread::spawn(move || stdin.write_all(input.as_bytes()));
     let stderr = child.stderr.take().ok_or("claude stderr unavailable")?;
     let stderr_reader = std::thread::spawn(move || {
@@ -258,7 +263,7 @@ pub fn interactive(
     Ok(command)
 }
 
-fn parse_result(output: &[u8]) -> Result<String, String> {
+fn parse_result(output: &[u8]) -> Result<AgentReply, String> {
     let value: serde_json::Value = serde_json::from_slice(output)
         .map_err(|error| format!("claude returned invalid JSON: {error}"))?;
     let result = value["result"]
@@ -267,12 +272,31 @@ fn parse_result(output: &[u8]) -> Result<String, String> {
     if value["is_error"].as_bool() == Some(true) {
         return Err(result.to_owned());
     }
-    Ok(result.to_owned())
+    let used_models = value["modelUsage"].as_object().map(|usage| {
+        usage
+            .keys()
+            .map(|name| {
+                name.chars()
+                    .filter(|character| !character.is_control())
+                    .take(120)
+                    .collect::<String>()
+            })
+            .filter(|name| !name.is_empty())
+            .collect::<Vec<_>>()
+    });
+    let model_info = match used_models {
+        Some(models) if !models.is_empty() => ModelInfo::Reported(models),
+        _ => ModelInfo::Unreported,
+    };
+    Ok(AgentReply {
+        text: result.to_owned(),
+        model_info: Some(model_info),
+    })
 }
 
 #[cfg(test)]
 mod tests {
-    use super::apply_effort;
+    use super::{apply_effort, ModelInfo};
     use crate::session::ReasoningEffort;
     use std::process::Command;
 
@@ -298,9 +322,14 @@ mod tests {
 
     #[test]
     fn result_errors_are_not_shown_as_answers() {
+        let reply = parse_result(br#"{"type":"result","is_error":false,"result":"found it","modelUsage":{"claude-opus-5-5":{},"claude-fable-5-1":{}}}"#).unwrap();
+        assert_eq!(reply.text, "found it");
         assert_eq!(
-            parse_result(br#"{"type":"result","is_error":false,"result":"found it"}"#).unwrap(),
-            "found it"
+            reply.model_info,
+            Some(ModelInfo::Reported(vec![
+                "claude-fable-5-1".into(),
+                "claude-opus-5-5".into()
+            ]))
         );
         assert_eq!(
             parse_result(br#"{"type":"result","is_error":true,"result":"denied"}"#).unwrap_err(),

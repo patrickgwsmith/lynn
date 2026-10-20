@@ -6,7 +6,14 @@ use std::thread;
 use crate::session::{AgentAccess, ReasoningEffort};
 
 pub const READ_ONLY_REPLY_INSTRUCTION: &str =
-    "Answer in one concise plain-text line. Give the finding directly; omit headings and Markdown.";
+    "Answer in one concise plain-text line, preferably under 40 words. Give the finding directly; omit headings, Markdown, preambles, and extra explanation. If the user explicitly requests a longer or structured answer, follow that request.";
+
+pub fn request_for_access(task: &str, access: AgentAccess) -> String {
+    match access {
+        AgentAccess::ReadOnly => format!("{task}\n\n{READ_ONLY_REPLY_INSTRUCTION}"),
+        AgentAccess::ReadWrite => task.to_owned(),
+    }
+}
 
 /// Paths under the agent user's home directory that agent CLIs write state,
 /// credentials, and caches to, and whether each is matched as a name prefix
@@ -38,6 +45,36 @@ pub struct Request<'a> {
     pub access: AgentAccess,
     pub user: AgentUser,
     pub effort: ReasoningEffort,
+}
+
+/// Where the model detail shown on expansion came from.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ModelInfo {
+    Reported(Vec<String>),
+    Requested(String),
+    Unreported,
+}
+
+/// The answer and any model detail available for expansion.
+#[derive(Debug)]
+pub struct AgentReply {
+    pub text: String,
+    pub model_info: Option<ModelInfo>,
+}
+
+impl From<&str> for AgentReply {
+    fn from(text: &str) -> Self {
+        text.to_owned().into()
+    }
+}
+
+impl From<String> for AgentReply {
+    fn from(text: String) -> Self {
+        Self {
+            text,
+            model_info: None,
+        }
+    }
 }
 
 pub fn command(program: &str, user: AgentUser) -> Command {
@@ -172,7 +209,7 @@ pub fn run_interactive(mut command: Command, program: &str) -> i32 {
             .code()
             .unwrap_or_else(|| 128 + status.signal().unwrap_or(0)),
         Err(error) => {
-            eprintln!("euka: {program}: {error}");
+            eprintln!("lynn: {program}: {error}");
             if error.kind() == ErrorKind::NotFound {
                 127
             } else {
@@ -183,7 +220,7 @@ pub fn run_interactive(mut command: Command, program: &str) -> i32 {
 }
 
 pub fn session_input(context: &str, task: &str) -> String {
-    format!("Euka session context:\n{context}\nUser request:\n{task}\n")
+    format!("Lynn session context:\n{context}\nUser request:\n{task}\n")
 }
 
 pub fn run(

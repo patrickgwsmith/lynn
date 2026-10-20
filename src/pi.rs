@@ -10,6 +10,7 @@ pub fn run(
     access: AgentAccess,
     user: AgentUser,
 ) -> Result<String, String> {
+    let task = agent_cli::request_for_access(task, access);
     super::agent_cli::run(
         "pi",
         &[
@@ -23,11 +24,11 @@ pub fn run(
                 AgentAccess::ReadWrite => "read,grep,find,ls,edit,write,bash",
             },
             match access {
-                AgentAccess::ReadOnly => "Answer the Euka user request supplied on stdin. Use the Euka session context and inspect project files as needed. Do not change files.",
-                AgentAccess::ReadWrite => "Carry out the Euka user request supplied on stdin. Use the Euka session context and project files as needed. You may change files and run commands.",
+                AgentAccess::ReadOnly => "Answer the Lynn user request supplied on stdin. Use the Lynn session context and inspect project files as needed. Do not change files.",
+                AgentAccess::ReadWrite => "Carry out the Lynn user request supplied on stdin. Use the Lynn session context and project files as needed. You may change files and run commands.",
             },
         ],
-        task,
+        &task,
         cwd,
         context,
         user,

@@ -1,3 +1,4 @@
+use crate::agent_cli;
 use crate::session::{self, AgentAccess};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -11,7 +12,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 static NEXT_SCHEMA: AtomicU64 = AtomicU64::new(0);
 
 const SCHEMA: &str = r#"{
-  "title": "EukaStep",
+  "title": "LynnStep",
   "type": "object",
   "additionalProperties": false,
   "x-order": ["action", "path", "text"],
@@ -24,7 +25,7 @@ const SCHEMA: &str = r#"{
 }"#;
 
 const FINAL_SCHEMA: &str = r#"{
-  "title": "EukaFinal",
+  "title": "LynnFinal",
   "type": "object",
   "additionalProperties": false,
   "x-order": ["action", "path", "text"],
@@ -113,14 +114,15 @@ fn task_scope(task: &str, references: &str) -> TaskScope {
     }
 }
 
-const INSTRUCTIONS: &str = "You are Euka's coding agent. Respond with exactly one JSON step matching the supplied schema. Euka executes each action and sends back the result in the next prompt. You cannot inspect project files directly: choose action=list to list a directory or read to read a file, then choose final only after the results answer the user's question. For list/read use path relative to Workspace; use '.' for its root. To replace a file, choose write with path and full replacement text. To execute a command, choose run with the command in text. For final, put the answer in text. Use an empty string for unused fields. Inspect relevant files before changing them. Do not claim work succeeded without observing its result.";
+const INSTRUCTIONS: &str = "You are Lynn's coding agent. Respond with exactly one JSON step matching the supplied schema. Lynn executes each action and sends back the result in the next prompt. You cannot inspect project files directly: choose action=list to list a directory or read to read a file, then choose final only after the results answer the user's question. For list/read use path relative to Workspace; use '.' for its root. To replace a file, choose write with path and full replacement text. To execute a command, choose run with the command in text. For final, put the answer in text. Use an empty string for unused fields. Inspect relevant files before changing them. Do not claim work succeeded without observing its result.";
 
 struct SchemaFile(PathBuf);
 
 impl SchemaFile {
     fn new(schema: &str) -> Result<Self, String> {
         let id = NEXT_SCHEMA.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!("euka-fm-{}-{id}.json", std::process::id()));
+        let path =
+            std::env::temp_dir().join(format!("lynn-fm-{}-{id}.json", std::process::id()));
         let mut file = OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -147,8 +149,10 @@ pub fn run(
     access: AgentAccess,
 ) -> Result<String, String> {
     match task_scope(task, references) {
-        TaskScope::ReferenceSummary => return respond_text(&summary_prompt(task, references)),
-        TaskScope::SessionSummary => return respond_text(&summary_prompt(task, context)),
+        TaskScope::ReferenceSummary => {
+            return respond_text(&summary_prompt(task, references, access))
+        }
+        TaskScope::SessionSummary => return respond_text(&summary_prompt(task, context, access)),
         TaskScope::Workspace => {}
     }
     let root = cwd.canonicalize().map_err(|e| format!("workspace: {e}"))?;
@@ -163,9 +167,14 @@ pub fn run(
     })
 }
 
-fn summary_prompt(task: &str, source: &str) -> String {
+fn summary_prompt(task: &str, source: &str, access: AgentAccess) -> String {
+    let reply_instruction = if access == AgentAccess::ReadOnly {
+        agent_cli::READ_ONLY_REPLY_INSTRUCTION
+    } else {
+        "Keep the answer concise."
+    };
     format!(
-        "Answer the request from the supplied Euka session results. Use relevant figures from earlier replies when present. If the requested facts are absent, say so; do not invent them. Keep the answer concise.\n\nRequest: {task}\n\nEuka session results:\n{source}"
+        "Answer the request from the supplied Lynn session results. Use relevant figures from earlier replies when present. If the requested facts are absent, say so; do not invent them.\n\nRequest: {task}\n\nLynn session results:\n{source}\n\n{reply_instruction}"
     )
 }
 
@@ -194,12 +203,20 @@ fn run_with(
             StepMode::Tools => "Choose the next step. If the tool results answer the task, choose final now. Never repeat an identical tool call.",
             StepMode::Final => "No more tool calls are available. Choose final now. Answer from the observed results, and say clearly if they are insufficient.",
         };
+        let reply_instruction = if access == AgentAccess::ReadOnly {
+            format!(
+                "For the final answer's text field: {} Keep all steps in the required JSON schema.",
+                agent_cli::READ_ONLY_REPLY_INSTRUCTION
+            )
+        } else {
+            String::new()
+        };
         let prompt = format!(
-            "Task: {task}\nWorkspace: {}\n{access_instruction}\nShared session:\n{context}\nPrior tool results:\n{observations}\n{next_step}",
+            "Task: {task}\nWorkspace: {}\n{access_instruction}\nShared session:\n{context}\nPrior tool results:\n{observations}\n{next_step}\n{reply_instruction}",
             root.display()
         );
         let step = respond(mode, &prompt)?;
-        if std::env::var_os("EUKA_FM_DEBUG").is_some() {
+        if std::env::var_os("LYNN_FM_DEBUG").is_some() {
             eprintln!("fm step: {step}");
         }
         let action = step["action"].as_str().ok_or("fm omitted action")?;
@@ -406,7 +423,7 @@ mod tests {
 
     #[test]
     fn lists_and_reads_workspace_files() {
-        let root = std::env::temp_dir().join(format!("euka-fm-read-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("lynn-fm-read-{}", std::process::id()));
         fs::create_dir_all(&root).unwrap();
         fs::write(root.join("note.txt"), "hello").unwrap();
         let root = root.canonicalize().unwrap();
@@ -484,7 +501,10 @@ mod tests {
             task_scope("Summarize #3 and inspect src/main.rs", references),
             TaskScope::Workspace
         );
-        assert!(summary_prompt("Summarize #3 in 5 words", references).contains(references));
+        assert!(
+            summary_prompt("Summarize #3 in 5 words", references, AgentAccess::ReadOnly)
+                .contains(references)
+        );
     }
 
     #[test]
@@ -498,7 +518,7 @@ mod tests {
             TaskScope::Workspace
         );
         let context = "response (luna?#3): Compiled: 120 ops/s; interpreted: 20 ops/s.\n";
-        let prompt = summary_prompt("summarize the ops/s", context);
+        let prompt = summary_prompt("summarize the ops/s", context, AgentAccess::ReadOnly);
         assert!(prompt.contains(context));
         assert!(prompt.contains("Request: summarize the ops/s"));
     }

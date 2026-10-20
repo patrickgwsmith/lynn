@@ -1,4 +1,5 @@
 use crate::agent_cli::AgentUser;
+use crate::agent_cli::ModelInfo;
 use crate::shell::ShellExecution;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
@@ -14,6 +15,7 @@ pub struct Session {
     pub detail: DisplayDetail,
     pub expanded_response_ids: BTreeSet<usize>,
     pub agent_efforts: BTreeMap<usize, ReasoningEffort>,
+    pub model_details: BTreeMap<usize, ModelInfo>,
     pub streaming_agents: BTreeSet<usize>,
 }
 
@@ -328,6 +330,7 @@ impl Session {
             detail: DisplayDetail::Compact,
             expanded_response_ids: BTreeSet::new(),
             agent_efforts: BTreeMap::new(),
+            model_details: BTreeMap::new(),
             streaming_agents: BTreeSet::new(),
         })
     }
@@ -1154,8 +1157,8 @@ mod tests {
     #[test]
     fn live_head_is_classified_and_labeled() {
         assert!(matches!(
-            classify("+ HEAD https://github.com/patrickgwsmith/euka"),
-            Input::LiveHead("https://github.com/patrickgwsmith/euka")
+            classify("+ HEAD https://github.com/patrickgwsmith/lynn"),
+            Input::LiveHead("https://github.com/patrickgwsmith/lynn")
         ));
         assert!(matches!(
             classify("+HEAD https://example.com/"),

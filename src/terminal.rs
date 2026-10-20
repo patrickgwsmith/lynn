@@ -1,7 +1,9 @@
 use crate::session::DisplayDetail;
 use std::collections::BTreeSet;
+use std::ffi::OsStr;
 use std::io::{self, Write};
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, RawFd};
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use unicode_width::UnicodeWidthChar;
 
@@ -113,6 +115,7 @@ impl Terminal {
         detail: DisplayDetail,
         color: bool,
         mut statuses: Vec<String>,
+        wake_fd: RawFd,
         mut notices: impl FnMut() -> (Vec<String>, Vec<String>),
     ) -> io::Result<ReadResult> {
         let _raw = RawMode::new()?;
@@ -122,7 +125,7 @@ impl Terminal {
         let mut saved = Vec::new();
         let mut last_kill = None;
         let mut display = EditorDisplay::default();
-        write_statuses(io::stdout().lock(), &statuses)?;
+        let mut status_rows = write_statuses(io::stdout().lock(), &statuses)?;
         redraw(
             &mut display,
             &bytes,
@@ -132,16 +135,16 @@ impl Terminal {
             color,
         )?;
         loop {
-            let key = match read_byte_timeout(100)? {
+            let key = match read_byte_or_notice(wake_fd)? {
                 Some(key) => key,
                 None => {
                     let (updates, new_statuses) = notices();
                     if !updates.is_empty() || new_statuses != statuses {
                         let mut stdout = io::stdout().lock();
-                        clear_editor(&mut stdout, statuses.len(), &mut display)?;
+                        clear_editor(&mut stdout, status_rows, &mut display)?;
                         write_notices(&mut stdout, &updates)?;
                         statuses = new_statuses;
-                        write_statuses(&mut stdout, &statuses)?;
+                        status_rows = write_statuses(&mut stdout, &statuses)?;
                         stdout.flush()?;
                         drop(stdout);
                         redraw(
@@ -160,7 +163,7 @@ impl Terminal {
             match key {
                 b'\r' | b'\n' => {
                     let mut stdout = io::stdout().lock();
-                    clear_editor(&mut stdout, statuses.len(), &mut display)?;
+                    clear_editor(&mut stdout, status_rows, &mut display)?;
                     write!(
                         stdout,
                         "{}",
@@ -177,7 +180,7 @@ impl Terminal {
                 }
                 3 => {
                     let mut stdout = io::stdout().lock();
-                    clear_editor(&mut stdout, statuses.len(), &mut display)?;
+                    clear_editor(&mut stdout, status_rows, &mut display)?;
                     write!(
                         stdout,
                         "{}",
@@ -190,7 +193,7 @@ impl Terminal {
                 }
                 4 if bytes.is_empty() => {
                     let mut stdout = io::stdout().lock();
-                    clear_editor(&mut stdout, statuses.len(), &mut display)?;
+                    clear_editor(&mut stdout, status_rows, &mut display)?;
                     stdout.write_all(b"\r\n")?;
                     stdout.flush()?;
                     return Ok(ReadResult::Eof);
@@ -296,9 +299,9 @@ impl Terminal {
                                 cursor = completion.start + replacement.len();
                             } else if completion.matches.len() > 1 {
                                 let mut stdout = io::stdout().lock();
-                                clear_editor(&mut stdout, statuses.len(), &mut display)?;
+                                clear_editor(&mut stdout, status_rows, &mut display)?;
                                 write!(stdout, "{}\r\n", completion.matches.join("  "))?;
-                                write_statuses(&mut stdout, &statuses)?;
+                                status_rows = write_statuses(&mut stdout, &statuses)?;
                                 stdout.flush()?;
                             }
                         }
@@ -353,7 +356,7 @@ impl Terminal {
                             }
                             Some(b'B') if bytes.is_empty() => {
                                 let mut stdout = io::stdout().lock();
-                                clear_editor(&mut stdout, statuses.len(), &mut display)?;
+                                clear_editor(&mut stdout, status_rows, &mut display)?;
                                 stdout.flush()?;
                                 return Ok(ReadResult::Expand);
                             }
@@ -392,7 +395,7 @@ impl Terminal {
                 12 => {
                     clear_screen()?;
                     display = EditorDisplay::default();
-                    write_statuses(io::stdout().lock(), &statuses)?;
+                    status_rows = write_statuses(io::stdout().lock(), &statuses)?;
                 }
                 c if c >= 32 => {
                     bytes.insert(cursor, c);
@@ -433,12 +436,20 @@ fn clear_editor(
     output.write_all(b"\r\x1b[0J")
 }
 
-fn write_statuses(mut output: impl Write, statuses: &[String]) -> io::Result<()> {
+fn write_statuses(output: impl Write, statuses: &[String]) -> io::Result<usize> {
+    write_statuses_with_width(output, statuses, columns().saturating_sub(1).max(2))
+}
+
+fn write_statuses_with_width(
+    mut output: impl Write,
+    statuses: &[String],
+    width: usize,
+) -> io::Result<usize> {
+    let mut rows = 0;
     for status in statuses {
-        output.write_all(status.as_bytes())?;
-        output.write_all(b"\r\n")?;
+        rows += write_wrapped(&mut output, &format!("{status}\n"), width)?.row;
     }
-    Ok(())
+    Ok(rows)
 }
 
 fn write_notices(mut output: impl Write, updates: &[String]) -> io::Result<()> {
@@ -492,6 +503,62 @@ fn read_byte_timeout(timeout_ms: i32) -> io::Result<Option<u8>> {
         ));
     }
     read_byte()
+}
+
+fn read_byte_or_notice(wake_fd: RawFd) -> io::Result<Option<u8>> {
+    let mut fds = [
+        libc::pollfd {
+            fd: 0,
+            events: libc::POLLIN,
+            revents: 0,
+        },
+        libc::pollfd {
+            fd: wake_fd,
+            events: libc::POLLIN,
+            revents: 0,
+        },
+    ];
+    let ready = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, -1) };
+    if ready < 0 {
+        let error = io::Error::last_os_error();
+        return if error.kind() == io::ErrorKind::Interrupted {
+            Ok(None)
+        } else {
+            Err(error)
+        };
+    }
+    if fds[0].revents & libc::POLLHUP != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::BrokenPipe,
+            "terminal input closed",
+        ));
+    }
+    if fds[0].revents & libc::POLLIN != 0 {
+        return read_byte();
+    }
+    if fds[1].revents & libc::POLLIN != 0 {
+        let mut buffer = [0u8; 256];
+        loop {
+            let count = unsafe {
+                libc::read(
+                    wake_fd,
+                    buffer.as_mut_ptr() as *mut libc::c_void,
+                    buffer.len(),
+                )
+            };
+            if count <= 0 {
+                let error = io::Error::last_os_error();
+                if count == 0 || error.kind() == io::ErrorKind::WouldBlock {
+                    break;
+                }
+                if error.kind() != io::ErrorKind::Interrupted {
+                    return Err(error);
+                }
+            }
+        }
+        return Ok(None);
+    }
+    Err(io::Error::other("terminal or wake socket is unavailable"))
 }
 
 fn read_bracketed_paste() -> io::Result<Vec<u8>> {
@@ -765,10 +832,68 @@ fn write_input_parts(mut output: impl Write, line: &str, style: InputStyle) -> i
             return write_input_parts(output, &line[end..], style);
         }
         output.write_all(&line.as_bytes()[end..])?;
+    } else if matches!(style, InputStyle::Entered) {
+        if let Some((start, end)) = unknown_command_span(line) {
+            write!(
+                output,
+                "{}\x1b[1;31m{}\x1b[0m\x1b[1m{}",
+                &line[..start],
+                &line[start..end],
+                &line[end..]
+            )?;
+        } else {
+            output.write_all(line.as_bytes())?;
+        }
     } else {
         output.write_all(line.as_bytes())?;
     }
     Ok(())
+}
+
+fn unknown_command_span(line: &str) -> Option<(usize, usize)> {
+    let cwd = std::env::current_dir().ok()?;
+    let path = std::env::var_os("PATH")?;
+    unknown_command_span_in(line, &cwd, &path)
+}
+
+fn unknown_command_span_in(line: &str, cwd: &Path, path: &OsStr) -> Option<(usize, usize)> {
+    let start = line.len() - line.trim_start().len();
+    let rest = &line[start..];
+    let end = rest
+        .find(|character: char| character.is_whitespace() || matches!(character, '|' | '<' | '>'))
+        .unwrap_or(rest.len());
+    let word = &rest[..end];
+    if word.is_empty()
+        || word.starts_with(['#', '+', '-', '?', '!', '@', '$', '\'', '"'])
+        || word.starts_with("https://")
+        || word.starts_with("http://")
+        || matches!(word, "cd" | "exit" | "export" | "unset" | "reset")
+        || word
+            .split_once('=')
+            .is_some_and(|(name, _)| valid_assignment_name(name))
+    {
+        return None;
+    }
+    (!command_exists_in(word, cwd, path)).then_some((start, start + end))
+}
+
+fn valid_assignment_name(name: &str) -> bool {
+    let mut bytes = name.bytes();
+    bytes
+        .next()
+        .is_some_and(|first| first.is_ascii_alphabetic() || first == b'_')
+        && bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+}
+
+fn command_exists_in(command: &str, cwd: &Path, path: &OsStr) -> bool {
+    let is_executable = |candidate: &Path| {
+        std::fs::metadata(candidate)
+            .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+    };
+    if command.contains('/') {
+        return is_executable(&cwd.join(command));
+    }
+    std::env::split_paths(path).any(|directory| is_executable(&cwd.join(directory).join(command)))
 }
 
 pub fn styled_input(line: &str, color: bool) -> String {
@@ -1065,11 +1190,13 @@ fn common_prefix(strings: &[String]) -> String {
 mod tests {
     use super::{
         backward_word, clear_editor, completions_in, forward_word, kill, normalize_paste,
-        prompt_for_display, selector_highlight, styled_input, write_entered_input, write_input,
-        write_notices, write_title, write_wrapped, EditorDisplay, KillDirection, SelectorKind,
+        prompt_for_display, selector_highlight, styled_input, unknown_command_span_in,
+        write_entered_input, write_input, write_notices, write_statuses_with_width, write_title,
+        write_wrapped, EditorDisplay, KillDirection, SelectorKind,
     };
     use crate::session::DisplayDetail;
     use std::fs;
+    use std::os::unix::fs::PermissionsExt;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
@@ -1230,13 +1357,57 @@ mod tests {
     }
 
     #[test]
+    fn unknown_first_command_is_red_without_coloring_its_arguments() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let unknown = format!("lynn_missing_command_{unique}");
+        let mut output = Vec::new();
+        write_entered_input(&mut output, &format!("{unknown} hello.txt"), true).unwrap();
+        assert_eq!(
+            output,
+            format!("\x1b[1m\x1b[1;31m{unknown}\x1b[0m\x1b[1m hello.txt\x1b[0m").as_bytes()
+        );
+    }
+
+    #[test]
+    fn command_lookup_checks_builtins_path_and_executable_files() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("lynn-command-color-{unique}"));
+        fs::create_dir_all(&root).unwrap();
+        let cat = root.join("cat");
+        fs::write(&cat, "").unwrap();
+        fs::set_permissions(&cat, fs::Permissions::from_mode(0o755)).unwrap();
+        let dog = root.join("dog");
+        fs::write(&dog, "").unwrap();
+        fs::set_permissions(&dog, fs::Permissions::from_mode(0o644)).unwrap();
+
+        let lookup = |line| unknown_command_span_in(line, &root, root.as_os_str());
+        assert_eq!(lookup("cat hello.txt"), None);
+        assert_eq!(lookup("  dog hello.txt"), Some((2, 5)));
+        assert_eq!(lookup("./cat hello.txt"), None);
+        assert_eq!(lookup("./dog hello.txt"), Some((0, 5)));
+        assert_eq!(lookup("cd elsewhere"), None);
+        assert_eq!(lookup("NAME=value"), None);
+        assert_eq!(lookup("opus task"), Some((0, 4)));
+        assert_eq!(lookup("# a note"), None);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn tab_completes_argument_paths_and_escapes_spaces() {
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let root =
-            std::env::temp_dir().join(format!("euka-completion-{}-{unique}", std::process::id()));
+        let root = std::env::temp_dir().join(format!(
+            "lynn-completion-{}-{unique}",
+            std::process::id()
+        ));
         fs::create_dir_all(root.join("My Docs")).unwrap();
         fs::write(root.join("report.txt"), "").unwrap();
         fs::write(root.join("My Docs").join("a b.txt"), "").unwrap();
@@ -1289,6 +1460,34 @@ mod tests {
         clear_editor(&mut output, 1, &mut display).unwrap();
         assert_eq!(output, b"\r\x1b[3A\r\x1b[0J");
         assert_eq!(display.cursor_row, 0);
+    }
+
+    #[test]
+    fn expanded_statuses_count_wrapped_and_multiline_rows_for_clearing() {
+        let mut output = Vec::new();
+        let rows = write_statuses_with_width(
+            &mut output,
+            &["\x1b[1m12345678901\nnext\x1b[0m".into(), "job: …".into()],
+            10,
+        )
+        .unwrap();
+        assert_eq!(
+            output,
+            b"\x1b[1m1234567890\r\n1\r\nnext\x1b[0m\r\njob: \xe2\x80\xa6\r\n"
+        );
+        assert_eq!(rows, 4);
+        output.clear();
+        let mut display = EditorDisplay { cursor_row: 2 };
+        clear_editor(&mut output, rows, &mut display).unwrap();
+        assert_eq!(output, b"\r\x1b[6A\r\x1b[0J");
+    }
+
+    #[test]
+    fn exact_width_status_has_no_extra_blank_row() {
+        let mut output = Vec::new();
+        let rows = write_statuses_with_width(&mut output, &["1234567890".into()], 10).unwrap();
+        assert_eq!(rows, 1);
+        assert_eq!(output, b"1234567890\r\n");
     }
 
     #[test]

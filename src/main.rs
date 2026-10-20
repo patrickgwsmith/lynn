@@ -12,7 +12,7 @@ mod session;
 mod shell;
 mod terminal;
 
-use agent_cli::AgentUser;
+use agent_cli::{AgentReply, AgentUser, ModelInfo};
 use session::{
     AgentAccess, AgentModel, AgentOptions, AgentOutput, AgentTask, DiffMode, DisplayDetail, Event,
     FeedSelection, Input, LiveCommand, LiveTarget, PromptMode, ReasoningEffort, Resource, Session,
@@ -20,18 +20,25 @@ use session::{
 use shell::Outcome;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::{self, BufRead, Write};
+use std::os::fd::AsRawFd;
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 #[cfg(target_os = "macos")]
 use std::process::Command;
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SendError, Sender};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use terminal::ReadResult;
+
+const MAX_IMPLICIT_WATCH_CONTEXT_BYTES: usize = 16 * 1024;
+const MAX_TOTAL_IMPLICIT_WATCH_CONTEXT_BYTES: usize = 64 * 1024;
+const MAX_REFERENCED_WATCH_CONTEXT_BYTES: usize = 128 * 1024;
 
 struct AgentUpdate {
     id: usize,
     model: String,
     access: AgentAccess,
-    result: Result<String, String>,
+    result: Result<AgentReply, String>,
 }
 
 struct QueuedAgent {
@@ -144,13 +151,35 @@ impl std::fmt::Display for AgentLabel<'_> {
 }
 
 fn render_agent(label: AgentLabel<'_>, display: AgentDisplay<'_>, styling: Styling) -> String {
+    render_agent_with_models(label, display, styling, None)
+}
+
+fn render_agent_with_models(
+    label: AgentLabel<'_>,
+    display: AgentDisplay<'_>,
+    styling: Styling,
+    model_info: Option<&ModelInfo>,
+) -> String {
     let color = styling == Styling::Terminal && output_color();
+    let detail = match model_info {
+        Some(ModelInfo::Reported(models)) => format!(" [used {}]", models.join(", ")),
+        Some(ModelInfo::Requested(model)) => {
+            format!(" [requested {model}; actual model unreported]")
+        }
+        Some(ModelInfo::Unreported) => " [model unreported]".to_owned(),
+        None => String::new(),
+    };
     match display {
         AgentDisplay::Working => format!("{label}: …"),
         AgentDisplay::Answer(text) | AgentDisplay::FullAnswer(text) if color => {
-            format!("\x1b[1;35m{label}:\x1b[0m {}", highlight_answer(text))
+            format!(
+                "\x1b[1;35m{label}{detail}:\x1b[0m {}",
+                highlight_answer(text)
+            )
         }
-        AgentDisplay::Answer(text) | AgentDisplay::FullAnswer(text) => format!("{label}: {text}"),
+        AgentDisplay::Answer(text) | AgentDisplay::FullAnswer(text) => {
+            format!("{label}{detail}: {text}")
+        }
         AgentDisplay::Error(text) if color => format!("\x1b[1;31m{label}: error:\x1b[0m {text}"),
         AgentDisplay::Error(text) => format!("{label}: error: {text}"),
     }
@@ -171,7 +200,12 @@ fn render_session_agent(
     prompt: PromptLine,
 ) -> String {
     let label = label.in_session(session);
-    let result = render_agent(label, display, Styling::Terminal);
+    let detail = if prompt == PromptLine::Always {
+        session.model_details.get(&label.id)
+    } else {
+        None
+    };
+    let result = render_agent_with_models(label, display, Styling::Terminal, detail);
     if prompt == PromptLine::WhenExpanded && !session.expanded_response_ids.contains(&label.id) {
         return result;
     }
@@ -219,6 +253,28 @@ fn expanded_agent_results(session: &mut Session) -> Vec<String> {
         session.expanded_response_ids.insert(*id);
     }
     results.into_iter().map(|(_, result)| result).collect()
+}
+
+fn pending_agent_statuses(session: &Session, workers: &Workers, color: bool) -> Vec<String> {
+    let mut statuses = Vec::new();
+    for (&id, status) in &workers.pending_agents {
+        if session.detail == DisplayDetail::Expanded {
+            if let Some(label) = agent_label_by_id(session, id) {
+                if let Some(input) = session.events.iter().find_map(|event| match event {
+                    Event::AgentRequest {
+                        id: request_id,
+                        input,
+                        ..
+                    } if *request_id == id => Some(input),
+                    _ => None,
+                }) {
+                    statuses.push(emphasize_prompt(&format!("{label} prompt: {input}"), color));
+                }
+            }
+        }
+        statuses.push(status.clone());
+    }
+    statuses
 }
 
 fn highlight_answer(text: &str) -> String {
@@ -301,12 +357,15 @@ struct LiveUpdate {
 }
 
 struct Workers {
-    worker_tx: Sender<WorkerUpdate>,
+    worker_tx: WakeSender<WorkerUpdate>,
     worker_rx: Receiver<WorkerUpdate>,
-    live_tx: Sender<LiveUpdate>,
+    live_tx: WakeSender<LiveUpdate>,
     live_rx: Receiver<LiveUpdate>,
+    wake_reader: UnixStream,
     next_agent_id: usize,
     active_agents: usize,
+    running_writer: Option<usize>,
+    write_gate: Arc<Mutex<()>>,
     pending_agents: BTreeMap<usize, String>,
     queued_agents: BTreeMap<usize, QueuedAgent>,
     interactive: bool,
@@ -316,17 +375,56 @@ struct Workers {
     hosts: HashMap<String, Sender<HttpRequest>>,
 }
 
+struct WakeSender<T> {
+    tx: Sender<T>,
+    wake_writer: Arc<UnixStream>,
+}
+
+impl<T> Clone for WakeSender<T> {
+    fn clone(&self) -> Self {
+        Self {
+            tx: self.tx.clone(),
+            wake_writer: Arc::clone(&self.wake_writer),
+        }
+    }
+}
+
+impl<T> WakeSender<T> {
+    fn send(&self, value: T) -> Result<(), SendError<T>> {
+        self.tx.send(value)?;
+        let _ = (&*self.wake_writer).write(&[1]);
+        Ok(())
+    }
+}
+
 impl Workers {
     fn new(interactive: bool) -> Self {
-        let (worker_tx, worker_rx) = mpsc::channel();
-        let (live_tx, live_rx) = mpsc::channel();
+        let (wake_reader, wake_writer) = UnixStream::pair().expect("create wake socket");
+        wake_reader
+            .set_nonblocking(true)
+            .expect("set wake socket nonblocking");
+        wake_writer
+            .set_nonblocking(true)
+            .expect("set wake socket nonblocking");
+        let wake_writer = Arc::new(wake_writer);
+        let (worker_channel, worker_rx) = mpsc::channel();
+        let (live_channel, live_rx) = mpsc::channel();
         Self {
-            worker_tx,
+            worker_tx: WakeSender {
+                tx: worker_channel,
+                wake_writer: Arc::clone(&wake_writer),
+            },
             worker_rx,
-            live_tx,
+            live_tx: WakeSender {
+                tx: live_channel,
+                wake_writer,
+            },
             live_rx,
+            wake_reader,
             next_agent_id: 1,
             active_agents: 0,
+            running_writer: None,
+            write_gate: Arc::new(Mutex::new(())),
             pending_agents: BTreeMap::new(),
             queued_agents: BTreeMap::new(),
             interactive,
@@ -353,7 +451,7 @@ fn main() {
     let mut session = match Session::new() {
         Ok(session) => session,
         Err(error) => {
-            eprintln!("euka: {error}");
+            eprintln!("lynn: {error}");
             std::process::exit(1);
         }
     };
@@ -367,7 +465,7 @@ fn main() {
     if interactive {
         if output_is_terminal {
             if let Err(error) = terminal::clear_screen() {
-                eprintln!("euka: terminal: {error}");
+                eprintln!("lynn: terminal: {error}");
                 std::process::exit(1);
             }
         }
@@ -376,7 +474,7 @@ fn main() {
                 let home = std::env::var_os("HOME");
                 let title = shortened_path(&session.cwd, home.as_deref().map(Path::new));
                 if let Err(error) = terminal::set_title(&title) {
-                    eprintln!("euka: terminal title: {error}");
+                    eprintln!("lynn: terminal title: {error}");
                     session.last_status = 1;
                     break;
                 }
@@ -384,16 +482,17 @@ fn main() {
             let color = output_color();
             let short_prompt = prompt(session.mode, &session.cwd, false, color);
             let full_prompt = prompt(session.mode, &session.cwd, true, color);
-            let statuses = workers.pending_agents.values().cloned().collect();
+            let statuses = pending_agent_statuses(&session, &workers, color);
             let line = match terminal.read_line(
                 &short_prompt,
                 &full_prompt,
                 session.detail,
                 color,
                 statuses,
+                workers.wake_reader.as_raw_fd(),
                 || {
                     let updates = drain_updates(&mut workers, &mut session);
-                    let statuses = workers.pending_agents.values().cloned().collect();
+                    let statuses = pending_agent_statuses(&session, &workers, color);
                     (updates, statuses)
                 },
             ) {
@@ -415,7 +514,7 @@ fn main() {
                     continue;
                 }
                 Err(error) => {
-                    eprintln!("euka: terminal: {error}");
+                    eprintln!("lynn: terminal: {error}");
                     break;
                 }
             };
@@ -435,7 +534,7 @@ fn main() {
                     }
                 }
                 Err(error) => {
-                    eprintln!("euka: input: {error}");
+                    eprintln!("lynn: input: {error}");
                     std::process::exit(1);
                 }
             }
@@ -539,7 +638,10 @@ fn reset_state(
 ) -> io::Result<()> {
     let fresh_session = Session::new()?;
     let interactive = workers.interactive;
+    // Reset discards results, but a write process may still be running.
+    let write_gate = Arc::clone(&workers.write_gate);
     *workers = Workers::new(interactive);
+    workers.write_gate = write_gate;
     *session = fresh_session;
     *terminal = terminal::Terminal::new();
     if interactive && unsafe { libc::isatty(1) == 1 } {
@@ -556,7 +658,7 @@ fn handle(
 ) -> Option<i32> {
     if line.trim() == "reset" {
         if let Err(error) = reset_state(session, workers, terminal) {
-            eprintln!("euka: reset: {error}");
+            eprintln!("lynn: reset: {error}");
             session.last_status = 1;
         }
         return None;
@@ -601,7 +703,7 @@ fn handle(
             let resolved = match resolve_inline(command, session, workers) {
                 Ok(resolved) => resolved,
                 Err(error) => {
-                    eprintln!("euka: {error}");
+                    eprintln!("lynn: {error}");
                     session.last_status = 1;
                     return None;
                 }
@@ -609,13 +711,19 @@ fn handle(
             let outcome = if inline::shell_substitution(&resolved) {
                 shell::execute_substitution_shell(&resolved).map(Outcome::Status)
             } else {
-                shell::execute(&resolved, session.last_status)
+                resolve_shell_references(&resolved, session, workers).and_then(|references| {
+                    if references.is_empty() {
+                        shell::execute(&resolved, session.last_status)
+                    } else {
+                        shell::execute_with_references(&resolved, session.last_status, &references)
+                    }
+                })
             };
             let status = match outcome {
                 Ok(Outcome::Status(status)) => status,
                 Ok(Outcome::Exit(status)) => return Some(status),
                 Err(error) => {
-                    eprintln!("euka: {error}");
+                    eprintln!("lynn: {error}");
                     1
                 }
             };
@@ -636,7 +744,7 @@ fn handle(
             let status = match shell::execute_host_shell(program, command, execution) {
                 Ok(status) => status,
                 Err(error) => {
-                    eprintln!("euka: {error}");
+                    eprintln!("lynn: {error}");
                     1
                 }
             };
@@ -661,7 +769,7 @@ fn handle(
                 session.last_status = 0;
             }
             None => {
-                eprintln!("euka: no agent reply yet");
+                eprintln!("lynn: no agent reply yet");
                 session.last_status = 1;
             }
         },
@@ -695,7 +803,7 @@ fn handle(
                     session.last_status = 0;
                 }
                 Err(error) => {
-                    eprintln!("euka: {error}");
+                    eprintln!("lynn: {error}");
                     session.last_status = 1;
                 }
             }
@@ -710,9 +818,9 @@ fn handle(
                 }
                 None => {
                     if let Some(watch) = session.live_commands.iter().find(|watch| watch.id == id) {
-                        eprintln!("euka: {}", watch_reference_error(watch, None));
+                        eprintln!("lynn: {}", watch_reference_error(watch, None));
                     } else {
-                        eprintln!("euka: no reply found for #{id}");
+                        eprintln!("lynn: no reply found for #{id}");
                     }
                     session.last_status = 1;
                 }
@@ -731,7 +839,7 @@ fn handle(
                         .find(|watch| watch.id == id)
                         .map(|watch| watch_reference_error(watch, Some(revision)))
                         .unwrap_or_else(|| format!("no watch found for #{id}"));
-                    eprintln!("euka: {error}");
+                    eprintln!("lynn: {error}");
                     session.last_status = 1;
                 }
             }
@@ -750,7 +858,7 @@ fn handle(
                 session.last_status = 0;
             }
             Err(error) => {
-                eprintln!("euka: {error}");
+                eprintln!("lynn: {error}");
                 session.last_status = 1;
             }
         },
@@ -782,16 +890,28 @@ fn handle(
         Input::Url(url) => start_http(url, HttpRequestKind::Load, session, workers),
         Input::Head(url) => start_http(url, HttpRequestKind::Head, session, workers),
         Input::UnavailableTarget { name, access } => {
-            eprintln!("euka: target '{name}{}' is not available", access.suffix());
+            eprintln!(
+                "lynn: target '{name}{}' is not available",
+                access.suffix()
+            );
             session.last_status = 1;
         }
         Input::InteractiveAgent {
             model,
             access,
             effort,
-        } => start_interactive_agent(model, access, effort, session),
+        } => {
+            if access == AgentAccess::ReadWrite {
+                wait_for_writers(session, workers);
+                let write_gate = Arc::clone(&workers.write_gate);
+                let _guard = write_gate.lock().unwrap_or_else(|error| error.into_inner());
+                start_interactive_agent(model, access, effort, session);
+            } else {
+                start_interactive_agent(model, access, effort, session);
+            }
+        }
         Input::Reserved(input) => {
-            eprintln!("euka: reserved syntax is not available yet: {input}");
+            eprintln!("lynn: reserved syntax is not available yet: {input}");
             session.last_status = 1;
         }
     }
@@ -805,7 +925,7 @@ fn run_agent(
     references: &str,
     output: AgentOutput,
     progress: impl FnMut(String),
-) -> Result<String, String> {
+) -> Result<AgentReply, String> {
     let agent_cli::Request {
         task,
         cwd,
@@ -815,7 +935,9 @@ fn run_agent(
         ..
     } = request;
     match (model, output) {
-        (AgentModel::Fm, AgentOutput::Final) => fm::run(task, cwd, context, references, access),
+        (AgentModel::Fm, AgentOutput::Final) => {
+            fm::run(task, cwd, context, references, access).map(Into::into)
+        }
         (
             AgentModel::Claude
             | AgentModel::Fable
@@ -840,8 +962,10 @@ fn run_agent(
             AgentModel::Codex | AgentModel::Sol | AgentModel::Luna | AgentModel::Terra,
             AgentOutput::Live,
         ) => codex::run_live(request, progress),
-        (AgentModel::Pi, AgentOutput::Final) => pi::run(task, cwd, context, access, user),
-        (AgentModel::Jsc, AgentOutput::Final) => jsc::run(task, cwd, access, user),
+        (AgentModel::Pi, AgentOutput::Final) => {
+            pi::run(task, cwd, context, access, user).map(Into::into)
+        }
+        (AgentModel::Jsc, AgentOutput::Final) => jsc::run(task, cwd, access, user).map(Into::into),
         (AgentModel::Fm | AgentModel::Pi | AgentModel::Jsc, AgentOutput::Live) => {
             Err("live status is unavailable for this agent".to_owned())
         }
@@ -855,7 +979,7 @@ fn interactive_agent(
     effort: ReasoningEffort,
 ) -> Result<Command, String> {
     match model {
-        AgentModel::Fm => Err("fm uses Euka's built-in interactive mode".to_owned()),
+        AgentModel::Fm => Err("fm uses Lynn's built-in interactive mode".to_owned()),
         AgentModel::Claude
         | AgentModel::Fable
         | AgentModel::Opus
@@ -884,14 +1008,14 @@ fn start_interactive_agent(
         access.suffix().to_string().repeat(effort.suffix_count())
     );
     println!(
-        "[{selector} interactive {} session; exit it to return to euka]",
+        "[{selector} interactive {} session; exit it to return to lynn]",
         access.description()
     );
     let _ = io::stdout().flush();
     let status = match interactive_agent(model, &session.cwd, access, effort) {
         Ok(command) => agent_cli::run_interactive(command, model.name()),
         Err(error) => {
-            eprintln!("euka: {error}");
+            eprintln!("lynn: {error}");
             1
         }
     };
@@ -952,15 +1076,18 @@ fn resolve_inline(
                     |_| {},
                 )
                 .map_err(|error| format!("{label}: {error}"))?;
-                let quoted = inline::quote_argument(&answer)?;
+                let quoted = inline::quote_argument(&answer.text)?;
+                if let Some(info) = answer.model_info {
+                    session.model_details.insert(id, info);
+                }
                 session.events.push(Event::AgentResponse {
                     id,
                     model: model.to_owned(),
-                    text: answer.clone(),
+                    text: answer.text.clone(),
                 });
                 println!(
                     "{}",
-                    render_agent(label, AgentDisplay::Answer(&answer), Styling::Terminal)
+                    render_agent(label, AgentDisplay::Answer(&answer.text), Styling::Terminal)
                 );
                 resolved.push_str(&quoted);
             }
@@ -976,12 +1103,12 @@ fn start_agents(request: AgentTask<'_>, session: &mut Session, workers: &mut Wor
         options,
     } = request;
     if task.is_empty() || models.is_empty() {
-        eprintln!("euka: agent unavailable or task is empty");
+        eprintln!("lynn: agent unavailable or task is empty");
         session.last_status = 1;
         return;
     }
     if options.user == AgentUser::Staffer && models.contains(&AgentModel::Fm) {
-        eprintln!("euka: fm cannot run as staffer");
+        eprintln!("lynn: fm cannot run as staffer");
         session.last_status = 1;
         return;
     }
@@ -991,7 +1118,7 @@ fn start_agents(request: AgentTask<'_>, session: &mut Session, workers: &mut Wor
             .any(|model| matches!(model, AgentModel::Fm | AgentModel::Pi | AgentModel::Jsc))
     {
         eprintln!(
-            "euka: extra reasoning effort is available only for Claude Code and Codex agents"
+            "lynn: extra reasoning effort is available only for Claude Code and Codex agents"
         );
         session.last_status = 1;
         return;
@@ -999,7 +1126,7 @@ fn start_agents(request: AgentTask<'_>, session: &mut Session, workers: &mut Wor
     let references = match resolve_references(task, session, workers) {
         Ok(references) => references,
         Err(error) => {
-            eprintln!("euka: {error}");
+            eprintln!("lynn: {error}");
             session.last_status = 1;
             return;
         }
@@ -1027,12 +1154,19 @@ fn start_agents(request: AgentTask<'_>, session: &mut Session, workers: &mut Wor
             options,
         };
         let label = request.label().to_string();
-        let status = match &references {
-            ReferenceResolution::Ready(references) => {
+        let predecessor = mutating_predecessor(&request, workers);
+        let status = match (&references, predecessor) {
+            (ReferenceResolution::Ready(references), None) => {
                 launch_agent(request, references.clone(), session, workers);
                 format!("{label}: …")
             }
-            ReferenceResolution::Pending(ids) => {
+            (_, Some(predecessor)) => {
+                let status = format!("{label}: queued behind mutating request #{predecessor}");
+                workers.pending_agents.insert(id, status.clone());
+                workers.queued_agents.insert(id, request);
+                status
+            }
+            (ReferenceResolution::Pending(ids), None) => {
                 let waiting_for = ids
                     .iter()
                     .map(|id| format!("#{id}"))
@@ -1051,12 +1185,59 @@ fn start_agents(request: AgentTask<'_>, session: &mut Session, workers: &mut Wor
     session.last_status = 0;
 }
 
+fn mutating_predecessor(request: &QueuedAgent, workers: &Workers) -> Option<usize> {
+    if request.options.access == AgentAccess::ReadOnly {
+        return None;
+    }
+    workers.running_writer.or_else(|| {
+        workers
+            .queued_agents
+            .values()
+            .find(|earlier| {
+                earlier.id < request.id && earlier.options.access == AgentAccess::ReadWrite
+            })
+            .map(|earlier| earlier.id)
+    })
+}
+
+fn wait_for_writers(session: &mut Session, workers: &mut Workers) {
+    let mut announced_wait = false;
+    while workers.running_writer.is_some()
+        || workers
+            .queued_agents
+            .values()
+            .any(|request| request.options.access == AgentAccess::ReadWrite)
+    {
+        if !announced_wait {
+            println!("[waiting for mutating requests before opening the interactive agent]");
+            let _ = io::stdout().flush();
+            announced_wait = true;
+        }
+        match workers.worker_rx.recv_timeout(Duration::from_millis(100)) {
+            Ok(update) => {
+                if let Some(line) = format_worker_update(update, session, workers) {
+                    println!("{line}");
+                }
+            }
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => break,
+        }
+        for line in drain_updates(workers, session) {
+            println!("{line}");
+        }
+    }
+}
+
 fn launch_agent(
     request: QueuedAgent,
     references: ResolvedReferences,
     session: &Session,
     workers: &mut Workers,
 ) {
+    if request.options.access == AgentAccess::ReadWrite {
+        debug_assert!(mutating_predecessor(&request, workers).is_none());
+        workers.running_writer = Some(request.id);
+    }
     let context = agent_context(session, &request, &references);
     workers
         .pending_agents
@@ -1070,7 +1251,14 @@ fn launch_agent(
     } = request;
     let references = references.text;
     let tx = workers.worker_tx.clone();
+    let write_gate = Arc::clone(&workers.write_gate);
     std::thread::spawn(move || {
+        // Keep writes exclusive even when reset replaces the session and its channels.
+        let _guard = if options.access == AgentAccess::ReadWrite {
+            Some(write_gate.lock().unwrap_or_else(|error| error.into_inner()))
+        } else {
+            None
+        };
         let progress_tx = tx.clone();
         let result = run_agent(
             model,
@@ -1127,7 +1315,7 @@ fn start_live_command(
 ) {
     let command = command.trim();
     if command.is_empty() {
-        eprintln!("euka: + {program}?: expected a command");
+        eprintln!("lynn: + {program}?: expected a command");
         session.last_status = 1;
         return;
     }
@@ -1143,7 +1331,7 @@ fn start_live_command(
 
 fn start_live_head(url: &str, session: &mut Session, workers: &mut Workers) {
     if let Err(error) = http::origin(url) {
-        eprintln!("euka: {error}");
+        eprintln!("lynn: {error}");
         session.last_status = 1;
         return;
     }
@@ -1163,7 +1351,7 @@ fn start_live_feed(
     workers: &mut Workers,
 ) {
     if let Err(error) = http::origin(url) {
-        eprintln!("euka: {error}");
+        eprintln!("lynn: {error}");
         session.last_status = 1;
         return;
     }
@@ -1328,7 +1516,7 @@ fn start_http(url: &str, kind: HttpRequestKind, session: &mut Session, workers: 
     let origin = match http::origin(url) {
         Ok(origin) => origin,
         Err(error) => {
-            eprintln!("euka: {error}");
+            eprintln!("lynn: {error}");
             session.last_status = 1;
             return;
         }
@@ -1372,7 +1560,7 @@ fn start_http(url: &str, kind: HttpRequestKind, session: &mut Session, workers: 
         })
         .is_err()
     {
-        eprintln!("euka: URL worker stopped");
+        eprintln!("lynn: URL worker stopped");
         session.last_status = 1;
     } else {
         workers.active_http += 1;
@@ -1386,11 +1574,13 @@ fn start_http(url: &str, kind: HttpRequestKind, session: &mut Session, workers: 
 fn print_help() {
     let color = output_color();
     for line in [
-        "Euka runs ordinary commands directly as a shell. Enter ? for this help.",
+        "Lynn runs ordinary commands directly as a shell. Enter ? for this help.",
         "Shell:",
         "  Output is shown to you, not shared with agents.",
         "  Agents see command input and exit status.",
         "  git status, cargo test, vim file   Run directly in the foreground",
+        "  cat #3 #7 >> brief.md  Append numbered results to a file",
+        "  diff #3.1 #3.2       Compare watch revisions as streamed inputs",
         "  cd, export, unset, exit; NAME=value are built-ins",
         "  reset                Clear session, history, watches, and request IDs",
         "  bash! command       Run a command through Bash as your user",
@@ -1445,7 +1635,7 @@ fn print_help() {
         "  echo $(date)        Run shell command substitution via Bash or Zsh",
         "  #3, codex?#3        Show a numbered result or full agent reply",
         "  #                   Show the latest completed agent reply",
-        "  Down at empty prompt  Expand this prompt and existing agent results",
+        "  Down at empty prompt  Expand prompt, replies, and model details",
         "  claude? agree? #3   Include a numbered result; queue if an agent is still working",
     ] {
         println!("{}", terminal::styled_input(line, color));
@@ -1501,31 +1691,39 @@ fn session_context_filtered(
     cwd: &Path,
 ) -> String {
     let mut context = format!("cwd: {}\n", cwd.display());
+    let mut watch_bytes_left = MAX_TOTAL_IMPLICIT_WATCH_CONTEXT_BYTES;
     for live in &session.live_commands {
         if referenced_ids.contains(&live.id) {
             continue;
         }
+        if watch_bytes_left == 0 {
+            context.push_str(
+                "... more watch output omitted from automatic context; refer to a watch by #n\n",
+            );
+            break;
+        }
+        let output = live_current_text(live);
+        let visible_bytes = output
+            .len()
+            .min(MAX_IMPLICIT_WATCH_CONTEXT_BYTES)
+            .min(watch_bytes_left);
         context.push_str(&format!(
             "watch {} {} in {}:\n{}\n",
             watch_revision_label(live),
             live.label(),
             live.cwd.display(),
-            live_current_text(live)
+            watch_context_excerpt(&output, visible_bytes)
         ));
+        watch_bytes_left -= visible_bytes;
     }
-    let recent_events: Vec<_> = session
-        .events
-        .iter()
-        .rev()
-        .filter(|event| match event {
-            Event::AgentRequest { id, .. } => Some(*id) != current_request_id,
-            Event::AgentResponse { id, .. } => !referenced_ids.contains(id),
-            Event::Resource { id, .. } | Event::HttpHead { id, .. } => !referenced_ids.contains(id),
-            _ => true,
-        })
-        .take(20)
-        .collect();
-    for event in recent_events.into_iter().rev() {
+    // Preserve the conversation: older requests and comments can contain
+    // instructions that still apply. Bound bulky external sources individually.
+    for event in session.events.iter().filter(|event| match event {
+        Event::AgentRequest { id, .. } => Some(*id) != current_request_id,
+        Event::AgentResponse { id, .. } => !referenced_ids.contains(id),
+        Event::Resource { id, .. } | Event::HttpHead { id, .. } => !referenced_ids.contains(id),
+        _ => true,
+    }) {
         match event {
             Event::Command { input, status } => {
                 context.push_str(&format!("command: {input} (exit {status})\n"))
@@ -1548,13 +1746,19 @@ fn session_context_filtered(
                     .unwrap_or_else(|| format!("{model}#{id}"));
                 context.push_str(&format!("response ({label}): {text}\n"))
             }
-            Event::Resource { resource, .. } => {
+            Event::Resource { id, resource } => {
                 context.push_str(&format!(
                     "resource: {} ({})\n",
                     resource.url, resource.content_type
                 ));
-                context.extend(resource.content.chars().take(8_000));
+                let mut content = resource.content.chars();
+                context.extend(content.by_ref().take(8_000));
                 context.push('\n');
+                if content.next().is_some() {
+                    context.push_str(&format!(
+                        "... more web page content omitted; refer to #{id} for the stored result\n"
+                    ));
+                }
             }
             Event::HttpHead { url, output, .. } => {
                 context.push_str(&format!("HEAD {url}:\n{output}\n"));
@@ -1563,9 +1767,6 @@ fn session_context_filtered(
     }
     for todo in &session.todos {
         context.push_str(&format!("todo: {todo}\n"));
-    }
-    if context.len() > 12_000 {
-        context = fm::tail(&context, 12_000);
     }
     context
 }
@@ -1668,6 +1869,26 @@ fn watch_response_by_id(session: &Session, id: usize, revision: Option<usize>) -
     ))
 }
 
+fn watch_context_excerpt(text: &str, max_bytes: usize) -> String {
+    if text.len() <= max_bytes {
+        return text.to_owned();
+    }
+    let marker = format!(
+        "\n... middle of watch output omitted for agent context ({} bytes total) ...\n",
+        text.len()
+    );
+    let available = max_bytes.saturating_sub(marker.len());
+    let mut head_end = available / 2;
+    let mut tail_start = text.len() - (available - head_end);
+    while !text.is_char_boundary(head_end) {
+        head_end -= 1;
+    }
+    while !text.is_char_boundary(tail_start) {
+        tail_start += 1;
+    }
+    format!("{}{}{}", &text[..head_end], marker, &text[tail_start..])
+}
+
 fn watch_revision_label(watch: &LiveCommand) -> String {
     if watch.revisions.is_empty() {
         format!("#{}", watch.id)
@@ -1703,6 +1924,56 @@ fn ready_references(
     }
 }
 
+fn resolve_shell_references(
+    command: &str,
+    session: &mut Session,
+    workers: &mut Workers,
+) -> Result<BTreeMap<String, String>, String> {
+    let arguments = shell::reference_arguments(command, session.last_status)?;
+    if arguments.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    let selection = arguments.join(" ");
+    let mut announced_wait = false;
+    loop {
+        for line in drain_updates(workers, session) {
+            println!("{line}");
+        }
+        match resolve_references(&selection, session, workers)? {
+            ReferenceResolution::Ready(_) => {
+                return arguments
+                    .into_iter()
+                    .map(|reference| {
+                        let text = ready_references(&reference, session, workers)?.text;
+                        Ok((reference, text))
+                    })
+                    .collect();
+            }
+            ReferenceResolution::Pending(ids) => {
+                if !announced_wait {
+                    let labels = ids
+                        .iter()
+                        .map(|id| format!("#{id}"))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    println!("[waiting for {labels}]");
+                    let _ = io::stdout().flush();
+                    announced_wait = true;
+                }
+            }
+        }
+        match workers.worker_rx.recv_timeout(Duration::from_millis(100)) {
+            Ok(update) => {
+                if let Some(line) = format_worker_update(update, session, workers) {
+                    println!("{line}");
+                }
+            }
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => return Err("result workers disconnected".into()),
+        }
+    }
+}
+
 fn resolve_references(
     task: &str,
     session: &Session,
@@ -1731,7 +2002,10 @@ fn resolve_references(
             if let Some(text) = watch_response_by_id(session, id, Some(revision)) {
                 if seen_watch_revisions.insert((id, revision)) {
                     seen.insert(id);
-                    context.push_str(&format!("\nReferenced {text}\n"));
+                    context.push_str(&format!(
+                        "\nReferenced {}\n",
+                        watch_context_excerpt(&text, MAX_REFERENCED_WATCH_CONTEXT_BYTES)
+                    ));
                 }
             } else if watch.revisions.is_empty() && watch.error.is_none() && revision == 1 {
                 pending.insert(id);
@@ -1762,7 +2036,10 @@ fn resolve_references(
                     let revision = watch.revisions.len();
                     if seen_watch_revisions.insert((id, revision)) {
                         seen.insert(id);
-                        context.push_str(&format!("\nReferenced {text}\n"));
+                        context.push_str(&format!(
+                            "\nReferenced {}\n",
+                            watch_context_excerpt(&text, MAX_REFERENCED_WATCH_CONTEXT_BYTES)
+                        ));
                     }
                 } else if watch.error.is_none() {
                     pending.insert(id);
@@ -1934,24 +2211,29 @@ fn format_worker_update(
 fn format_update(update: AgentUpdate, session: &mut Session, workers: &mut Workers) -> String {
     workers.active_agents = workers.active_agents.saturating_sub(1);
     workers.pending_agents.remove(&update.id);
-    let label = AgentLabel::new(&update.model, update.access, update.id).in_session(session);
-    let line = match &update.result {
-        Ok(text) => {
-            let display = match update.access {
-                AgentAccess::ReadOnly => AgentDisplay::Answer(text),
-                AgentAccess::ReadWrite => AgentDisplay::FullAnswer(text),
-            };
-            render_agent(label, display, Styling::Terminal)
-        }
-        Err(error) => render_agent(label, AgentDisplay::Error(error), Styling::Terminal),
-    };
-    if let Ok(text) = update.result {
-        session.events.push(Event::AgentResponse {
-            id: update.id,
-            model: update.model,
-            text,
-        });
+    if workers.running_writer == Some(update.id) {
+        workers.running_writer = None;
     }
+    let label = AgentLabel::new(&update.model, update.access, update.id).in_session(session);
+    let line = match update.result {
+        Ok(reply) => {
+            if let Some(info) = reply.model_info {
+                session.model_details.insert(update.id, info);
+            }
+            let display = match update.access {
+                AgentAccess::ReadOnly => AgentDisplay::Answer(&reply.text),
+                AgentAccess::ReadWrite => AgentDisplay::FullAnswer(&reply.text),
+            };
+            let line = render_agent(label, display, Styling::Terminal);
+            session.events.push(Event::AgentResponse {
+                id: update.id,
+                model: update.model,
+                text: reply.text,
+            });
+            line
+        }
+        Err(error) => render_agent(label, AgentDisplay::Error(&error), Styling::Terminal),
+    };
     resume_queued_agents(session, workers);
     line
 }
@@ -1965,8 +2247,18 @@ fn resume_queued_agents(session: &Session, workers: &mut Workers) {
         let resolution = resolve_references(&request.task, session, workers);
         match resolution {
             Ok(ReferenceResolution::Ready(references)) => {
-                let request = workers.queued_agents.remove(&id).unwrap();
-                launch_agent(request, references, session, workers);
+                if let Some(predecessor) = mutating_predecessor(request, workers) {
+                    workers.pending_agents.insert(
+                        id,
+                        format!(
+                            "{}: queued behind mutating request #{predecessor}",
+                            request.label()
+                        ),
+                    );
+                } else {
+                    let request = workers.queued_agents.remove(&id).unwrap();
+                    launch_agent(request, references, session, workers);
+                }
             }
             Ok(ReferenceResolution::Pending(ids)) => {
                 let status = ids
@@ -2008,6 +2300,455 @@ mod tests {
     use std::path::Path;
 
     #[test]
+    fn conversation_context_retains_early_instructions_and_large_replies() {
+        let mut session = Session::new().unwrap();
+        session.events.push(Event::Comment(
+            "Always preserve the existing CLI syntax".into(),
+        ));
+        session.events.push(Event::AgentRequest {
+            id: 1,
+            input: "Keep mutating agents serial across all models".into(),
+            access: AgentAccess::ReadWrite,
+            model: Some("opus".into()),
+        });
+        let reply = format!(
+            "Earlier findings:\n{}\nEnd of earlier findings",
+            "Important finding αβγ\n".repeat(2_000)
+        );
+        session.events.push(Event::AgentResponse {
+            id: 1,
+            model: "opus".into(),
+            text: reply.clone(),
+        });
+        for number in 0..100 {
+            session.events.push(Event::Command {
+                input: format!("command-{number}"),
+                status: 0,
+            });
+        }
+        session
+            .events
+            .push(Event::Comment("Latest instruction".into()));
+        session.todos.push("Validate cancellation".into());
+        let context = session_context(&session);
+        assert!(context.starts_with(&format!("cwd: {}\n", session.cwd.display())));
+        assert!(context.contains("comment: Always preserve the existing CLI syntax\n"));
+        assert!(context.contains(
+            "request (opus!#1, read-write): Keep mutating agents serial across all models\n"
+        ));
+        assert!(context.contains(&format!("response (opus!#1): {reply}\n")));
+        assert!(context.contains("command: command-0 (exit 0)\n"));
+        assert!(context.contains("command: command-99 (exit 0)\n"));
+        assert!(context.ends_with("comment: Latest instruction\ntodo: Validate cancellation\n"));
+        assert!(
+            context.find("Always preserve").unwrap() < context.find("Earlier findings").unwrap()
+        );
+        assert!(
+            context.find("End of earlier findings").unwrap() < context.find("command-0").unwrap()
+        );
+    }
+
+    #[test]
+    fn web_excerpts_report_omissions_and_explicit_references_retain_full_content() {
+        let mut session = Session::new().unwrap();
+        session
+            .events
+            .push(Event::Comment("Preserve this instruction".into()));
+        session.events.push(Event::Resource {
+            id: 3,
+            resource: crate::session::Resource {
+                url: "https://example.com/large".into(),
+                content_type: "text/plain".into(),
+                content: format!("{}TAIL_OF_PAGE", "α".repeat(9_000)),
+            },
+        });
+        let context = session_context(&session);
+        assert!(context.contains("comment: Preserve this instruction\n"));
+        assert!(context.contains(&"α".repeat(8_000)));
+        assert!(!context.contains("TAIL_OF_PAGE"));
+        assert!(context.contains("more web page content omitted; refer to #3"));
+        let workers = Workers::new(false);
+        let references = ready_references("Read #3", &session, &workers).unwrap();
+        assert!(references.text.contains(&"α".repeat(9_000)));
+        assert!(references.text.contains("TAIL_OF_PAGE"));
+        let automatic =
+            super::session_context_filtered(&session, &references.ids, None, &session.cwd);
+        assert!(!automatic.contains("resource:"));
+        assert!(automatic.contains("comment: Preserve this instruction\n"));
+    }
+
+    #[test]
+    fn down_expansion_shows_prompts_above_running_and_queued_statuses() {
+        let mut session = Session::new().unwrap();
+        let mut workers = Workers::new(false);
+        for (id, model, input, status) in [
+            (4, "opus", "Implement cancellation", "opus!#4: …"),
+            (
+                5,
+                "sol",
+                "Update the tests",
+                "sol!#5: queued behind mutating request #4",
+            ),
+        ] {
+            session.events.push(Event::AgentRequest {
+                id,
+                input: input.into(),
+                access: AgentAccess::ReadWrite,
+                model: Some(model.into()),
+            });
+            workers.pending_agents.insert(id, status.into());
+        }
+        assert_eq!(
+            super::pending_agent_statuses(&session, &workers, false),
+            ["opus!#4: …", "sol!#5: queued behind mutating request #4",]
+        );
+        session.detail = DisplayDetail::Expanded;
+        assert!(expanded_agent_results(&mut session).is_empty());
+        assert_eq!(
+            super::pending_agent_statuses(&session, &workers, false),
+            [
+                "opus!#4 prompt: Implement cancellation",
+                "opus!#4: …",
+                "sol!#5 prompt: Update the tests",
+                "sol!#5: queued behind mutating request #4",
+            ]
+        );
+        workers
+            .pending_agents
+            .insert(4, "opus!#4: Edit: src/main.rs".into());
+        assert_eq!(
+            &super::pending_agent_statuses(&session, &workers, false)[..2],
+            [
+                "opus!#4 prompt: Implement cancellation",
+                "opus!#4: Edit: src/main.rs",
+            ]
+        );
+        workers.pending_agents.remove(&4);
+        assert_eq!(
+            super::pending_agent_statuses(&session, &workers, false),
+            [
+                "sol!#5 prompt: Update the tests",
+                "sol!#5: queued behind mutating request #4",
+            ]
+        );
+        // Expanding a pending status must not mark a future answer as already expanded.
+        assert!(session.expanded_response_ids.is_empty());
+    }
+
+    #[test]
+    fn pending_prompt_preserves_multiline_input_and_live_selector() {
+        let mut session = Session::new().unwrap();
+        let mut workers = Workers::new(false);
+        session.events.push(Event::AgentRequest {
+            id: 4,
+            input: "Implement cancellation\nPreserve existing labels".into(),
+            access: AgentAccess::ReadWrite,
+            model: Some("opus".into()),
+        });
+        session.streaming_agents.insert(4);
+        session.detail = DisplayDetail::Expanded;
+        workers
+            .pending_agents
+            .insert(4, "opus?!#4: Read: src/main.rs".into());
+        assert_eq!(
+            super::pending_agent_statuses(&session, &workers, true),
+            [
+                "\x1b[1mopus?!#4 prompt: Implement cancellation\nPreserve existing labels\x1b[0m",
+                "opus?!#4: Read: src/main.rs",
+            ]
+        );
+        session.detail = DisplayDetail::Compact;
+        assert_eq!(
+            super::pending_agent_statuses(&session, &workers, false),
+            ["opus?!#4: Read: src/main.rs",]
+        );
+    }
+
+    #[test]
+    fn mutating_models_share_one_queue_and_read_only_requests_bypass_it() {
+        let mut session = Session::new().unwrap();
+        let mut workers = Workers::new(false);
+        workers.running_writer = Some(1);
+        workers.next_agent_id = 2;
+        workers.pending_agents.insert(1, "opus!#1: …".into());
+        workers.active_agents = 1;
+        session.events.push(Event::AgentRequest {
+            id: 1,
+            input: "first change".into(),
+            access: AgentAccess::ReadWrite,
+            model: Some("opus".into()),
+        });
+        for model in [AgentModel::Opus, AgentModel::Sol] {
+            start_agents(
+                AgentTask {
+                    task: "another change",
+                    models: vec![model],
+                    options: AgentOptions::new(AgentAccess::ReadWrite),
+                },
+                &mut session,
+                &mut workers,
+            );
+        }
+        assert_eq!(
+            workers.queued_agents.keys().copied().collect::<Vec<_>>(),
+            [2, 3]
+        );
+        assert!(workers.pending_agents[&2].contains("mutating request #1"));
+        assert!(workers.pending_agents[&3].contains("mutating request #1"));
+        assert_eq!(workers.running_writer, Some(1));
+
+        start_agents(
+            AgentTask {
+                task: "inspect",
+                models: vec![AgentModel::Jsc],
+                // Unsupported live output returns locally, without launching a provider.
+                options: AgentOptions {
+                    output: crate::session::AgentOutput::Live,
+                    ..AgentOptions::new(AgentAccess::ReadOnly)
+                },
+            },
+            &mut session,
+            &mut workers,
+        );
+        assert!(!workers.queued_agents.contains_key(&4));
+        let update = workers
+            .worker_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+        super::format_worker_update(update, &mut session, &mut workers);
+        assert_eq!(workers.running_writer, Some(1));
+        assert_eq!(workers.queued_agents.len(), 2);
+    }
+
+    #[test]
+    fn later_writes_do_not_overtake_an_earlier_write_waiting_for_references() {
+        let mut session = Session::new().unwrap();
+        let mut workers = Workers::new(false);
+        workers.next_agent_id = 2;
+        workers.pending_agents.insert(1, "opus?#1: …".into());
+        workers.active_agents = 1;
+        session.events.push(Event::AgentRequest {
+            id: 1,
+            input: "research".into(),
+            access: AgentAccess::ReadOnly,
+            model: Some("opus".into()),
+        });
+        for (model, task) in [
+            (AgentModel::Opus, "implement #1"),
+            (AgentModel::Sol, "another change"),
+        ] {
+            start_agents(
+                AgentTask {
+                    task,
+                    models: vec![model],
+                    options: AgentOptions::new(AgentAccess::ReadWrite),
+                },
+                &mut session,
+                &mut workers,
+            );
+        }
+        assert_eq!(workers.running_writer, None);
+        assert_eq!(workers.pending_agents[&2], "opus!#2: waiting for #1");
+        assert_eq!(
+            workers.pending_agents[&3],
+            "sol!#3: queued behind mutating request #2"
+        );
+        assert_eq!(
+            super::mutating_predecessor(&workers.queued_agents[&3], &workers),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn writer_queue_advances_on_success_and_failure() {
+        let mut session = Session::new().unwrap();
+        let mut workers = Workers::new(false);
+        workers.running_writer = Some(1);
+        workers.next_agent_id = 2;
+        workers.pending_agents.insert(1, "opus!#1: …".into());
+        workers.active_agents = 1;
+        session.events.push(Event::AgentRequest {
+            id: 1,
+            input: "first change".into(),
+            access: AgentAccess::ReadWrite,
+            model: Some("opus".into()),
+        });
+        for _ in 0..2 {
+            start_agents(
+                AgentTask {
+                    task: "inspect",
+                    models: vec![AgentModel::Jsc],
+                    options: AgentOptions {
+                        output: crate::session::AgentOutput::Live,
+                        ..AgentOptions::new(AgentAccess::ReadWrite)
+                    },
+                },
+                &mut session,
+                &mut workers,
+            );
+        }
+        format_update(
+            AgentUpdate {
+                id: 1,
+                model: "opus".into(),
+                access: AgentAccess::ReadWrite,
+                result: Ok("first change completed".into()),
+            },
+            &mut session,
+            &mut workers,
+        );
+        assert_eq!(workers.running_writer, Some(2));
+        assert!(!workers.queued_agents.contains_key(&2));
+        assert!(workers.queued_agents.contains_key(&3));
+        let update = workers
+            .worker_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+        let line = super::format_worker_update(update, &mut session, &mut workers).unwrap();
+        assert!(line.contains("live status is unavailable"));
+        assert_eq!(workers.running_writer, Some(3));
+        assert!(workers.queued_agents.is_empty());
+        let update = workers
+            .worker_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+        super::format_worker_update(update, &mut session, &mut workers);
+        assert_eq!(workers.running_writer, None);
+        assert_eq!(workers.active_agents, 0);
+        assert!(workers.pending_agents.is_empty());
+    }
+
+    #[test]
+    fn shell_references_select_replies_http_results_and_watch_revisions() {
+        let mut session = Session::new().unwrap();
+        let mut workers = Workers::new(false);
+        session.events.push(Event::AgentRequest {
+            id: 7,
+            input: "inspect".into(),
+            access: AgentAccess::ReadOnly,
+            model: Some("opus".into()),
+        });
+        session.events.push(Event::AgentResponse {
+            id: 7,
+            model: "opus".into(),
+            text: "answer without a newline".into(),
+        });
+        session.events.push(Event::HttpHead {
+            id: 12,
+            url: "https://example.com".into(),
+            output: "HTTP 200".into(),
+        });
+        session.live_commands.push(crate::session::LiveCommand {
+            id: 3,
+            cwd: session.cwd.clone(),
+            target: crate::session::LiveTarget::Shell {
+                program: "bash",
+                command: "printf result".into(),
+            },
+            output: "new".into(),
+            error: None,
+            last_run: Some("old".into()),
+            last_refresh: std::time::Instant::now(),
+            revisions: vec!["old".into(), "new".into()],
+        });
+        let references = super::resolve_shell_references(
+            "cat #7 opus?#7 '#99' #12 #3.1 #3 #7",
+            &mut session,
+            &mut workers,
+        )
+        .unwrap();
+        assert_eq!(references.len(), 5);
+        assert_eq!(
+            references["#7"],
+            "\nReferenced reply opus?#7:\nanswer without a newline\n"
+        );
+        assert_eq!(references["#7"], references["opus?#7"]);
+        assert!(references["#12"].contains("Referenced HTTP result #12:"));
+        assert!(references["#3.1"].contains("old"));
+        assert!(references["#3"].contains("new"));
+        assert!(references["#3"].contains("watch #3.2"));
+        assert!(super::resolve_shell_references("cat #7 #99", &mut session, &mut workers).is_err());
+    }
+
+    #[test]
+    fn shell_references_wait_for_pending_results_and_report_failures() {
+        let mut session = Session::new().unwrap();
+        let mut workers = Workers::new(false);
+        session.events.push(Event::AgentRequest {
+            id: 7,
+            input: "inspect".into(),
+            access: AgentAccess::ReadOnly,
+            model: Some("opus".into()),
+        });
+        workers.pending_agents.insert(7, "opus?#7: …".into());
+        workers.active_agents = 1;
+        let tx = workers.worker_tx.clone();
+        let sender = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            tx.send(super::WorkerUpdate::Agent(AgentUpdate {
+                id: 7,
+                model: "opus".into(),
+                access: AgentAccess::ReadOnly,
+                result: Ok("completed answer".into()),
+            }))
+            .unwrap();
+        });
+        let references =
+            super::resolve_shell_references("cat #7", &mut session, &mut workers).unwrap();
+        sender.join().unwrap();
+        assert!(references["#7"].contains("completed answer"));
+        assert!(workers.pending_agents.is_empty());
+
+        session.events.push(Event::AgentRequest {
+            id: 8,
+            input: "inspect".into(),
+            access: AgentAccess::ReadOnly,
+            model: Some("luna".into()),
+        });
+        workers.pending_agents.insert(8, "luna?#8: …".into());
+        workers.active_agents = 1;
+        workers
+            .worker_tx
+            .send(super::WorkerUpdate::Agent(AgentUpdate {
+                id: 8,
+                model: "luna".into(),
+                access: AgentAccess::ReadOnly,
+                result: Err("agent failed".into()),
+            }))
+            .unwrap();
+        assert!(super::resolve_shell_references("cat #8", &mut session, &mut workers).is_err());
+
+        session.live_commands.push(crate::session::LiveCommand {
+            id: 9,
+            cwd: session.cwd.clone(),
+            target: crate::session::LiveTarget::Shell {
+                program: "bash",
+                command: "printf result".into(),
+            },
+            output: String::new(),
+            error: None,
+            last_run: None,
+            last_refresh: std::time::Instant::now(),
+            revisions: Vec::new(),
+        });
+        workers.active_live = 1;
+        let tx = workers.live_tx.clone();
+        let sender = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            tx.send(super::LiveUpdate {
+                id: 9,
+                started_at: std::time::Instant::now(),
+                result: Ok("first watch result".into()),
+            })
+            .unwrap();
+        });
+        let references =
+            super::resolve_shell_references("cat #9.1", &mut session, &mut workers).unwrap();
+        sender.join().unwrap();
+        assert!(references["#9.1"].contains("first watch result"));
+    }
+
+    #[test]
     fn streamed_result_keeps_selector_in_final_and_recall() {
         let mut session = Session::new().unwrap();
         session.streaming_agents.insert(1);
@@ -2041,6 +2782,73 @@ mod tests {
     }
 
     #[test]
+    fn reported_model_is_shown_only_in_down_expansion() {
+        let mut session = Session::new().unwrap();
+        session.events.push(Event::AgentRequest {
+            id: 1,
+            input: "Inspect this".into(),
+            access: AgentAccess::ReadOnly,
+            model: Some("opus".into()),
+        });
+        let mut workers = Workers::new(false);
+        let line = format_update(
+            AgentUpdate {
+                id: 1,
+                model: "opus".into(),
+                access: AgentAccess::ReadOnly,
+                result: Ok(super::AgentReply {
+                    text: "Done".into(),
+                    model_info: Some(super::ModelInfo::Reported(vec!["claude-fable-5-1".into()])),
+                }),
+            },
+            &mut session,
+            &mut workers,
+        );
+        assert_eq!(line, "opus?#1: Done");
+        assert_eq!(
+            render_session_agent(
+                &session,
+                AgentLabel::new("opus", AgentAccess::ReadOnly, 1),
+                AgentDisplay::Answer("Done"),
+                PromptLine::WhenExpanded
+            ),
+            line
+        );
+        assert_eq!(
+            expanded_agent_results(&mut session),
+            ["opus?#1 prompt: Inspect this\nopus?#1 [used claude-fable-5-1]: Done"]
+        );
+    }
+
+    #[test]
+    fn codex_requested_model_is_labeled_as_unverified_on_expansion() {
+        let mut session = Session::new().unwrap();
+        session.events.push(Event::AgentRequest {
+            id: 1,
+            input: "Inspect this".into(),
+            access: AgentAccess::ReadOnly,
+            model: Some("luna".into()),
+        });
+        let mut workers = Workers::new(false);
+        let line = format_update(
+            AgentUpdate {
+                id: 1,
+                model: "luna".into(),
+                access: AgentAccess::ReadOnly,
+                result: Ok(super::AgentReply {
+                    text: "Looks fine".into(),
+                    model_info: Some(super::ModelInfo::Requested("gpt-6-luna".into())),
+                }),
+            },
+            &mut session,
+            &mut workers,
+        );
+        assert_eq!(line, "luna?#1: Looks fine");
+        assert_eq!(expanded_agent_results(&mut session),
+            ["luna?#1 prompt: Inspect this\nluna?#1 [requested gpt-6-luna; actual model unreported]: Looks fine"]);
+    }
+
+    #[test]
     fn reset_restarts_counters_and_discards_old_worker_updates() {
         let mut session = Session::new().unwrap();
         session.events.push(Event::Comment("old context".into()));
@@ -2051,10 +2859,14 @@ mod tests {
         workers.next_agent_id = 4;
         workers.next_http_id = 3;
         let old_sender = workers.worker_tx.clone();
+        let write_gate = std::sync::Arc::clone(&workers.write_gate);
+        let _write_guard = write_gate.lock().unwrap();
         let mut terminal = Terminal::new();
 
         reset_state(&mut session, &mut workers, &mut terminal).unwrap();
 
+        assert!(std::sync::Arc::ptr_eq(&write_gate, &workers.write_gate));
+        assert!(workers.write_gate.try_lock().is_err());
         assert_eq!(workers.next_agent_id, 1);
         assert_eq!(workers.next_http_id, 1);
         assert!(session.events.is_empty());
@@ -2078,8 +2890,8 @@ mod tests {
         let home = Path::new("/Users/pgwsmith");
         assert_eq!(shortened_path(home, Some(home)), "~");
         assert_eq!(
-            shortened_path(Path::new("/Users/pgwsmith/Collected/euka"), Some(home)),
-            "~/C/euka"
+            shortened_path(Path::new("/Users/pgwsmith/Collected/lynn"), Some(home)),
+            "~/C/lynn"
         );
         assert_eq!(
             shortened_path(Path::new("/Users/pgwsmith/.config/fish"), Some(home)),
@@ -2091,8 +2903,8 @@ mod tests {
         );
         assert_eq!(shortened_path(Path::new("/"), Some(home)), "/");
         assert_eq!(
-            shortened_path(Path::new("/Users/pgwsmith2/euka"), Some(home)),
-            "/U/p/euka"
+            shortened_path(Path::new("/Users/pgwsmith2/lynn"), Some(home)),
+            "/U/p/lynn"
         );
         assert_eq!(
             prompt(PromptMode::Shell, Path::new("/tmp/example"), true, false),
@@ -2281,7 +3093,7 @@ mod tests {
         for _ in 0..25 {
             session.events.push(Event::Comment("later context".into()));
         }
-        assert!(!session_context(&session).contains("multiline finding"));
+        assert!(session_context(&session).contains("multiline finding"));
         assert_eq!(
             ready_references("agree? codex?#3, codex?#3", &session, &workers)
                 .unwrap()
@@ -2612,6 +3424,26 @@ mod tests {
     }
 
     #[test]
+    fn worker_update_wakes_the_terminal() {
+        use std::io::Read;
+
+        let mut workers = Workers::new(true);
+        workers
+            .worker_tx
+            .send(super::WorkerUpdate::Agent(AgentUpdate {
+                id: 1,
+                model: "sol".into(),
+                access: AgentAccess::ReadOnly,
+                result: Err("test".into()),
+            }))
+            .unwrap();
+        let mut byte = [0];
+        workers.wake_reader.read_exact(&mut byte).unwrap();
+        assert_eq!(byte, [1]);
+        assert!(workers.worker_rx.try_recv().is_ok());
+    }
+
+    #[test]
     fn watch_results_keep_numbered_revisions_and_support_references() {
         let mut session = Session::new().unwrap();
         session.live_commands.push(crate::session::LiveCommand {
@@ -2671,5 +3503,15 @@ mod tests {
         assert_eq!(references.text.matches("Referenced watch #1.1").count(), 1);
         assert_eq!(references.text.matches("Referenced watch #1.2").count(), 1);
         assert_eq!(references.ids.into_iter().collect::<Vec<_>>(), vec![1]);
+    }
+
+    #[test]
+    fn watch_context_excerpt_respects_utf8_and_reports_omission() {
+        let output = format!("start\n{}\nend", "é".repeat(100));
+        let excerpt = super::watch_context_excerpt(&output, 100);
+        assert!(excerpt.starts_with("start\n"));
+        assert!(excerpt.ends_with("\nend"));
+        assert!(excerpt.contains(&format!("{} bytes total", output.len())));
+        assert_eq!(super::watch_context_excerpt(&output, output.len()), output);
     }
 }
