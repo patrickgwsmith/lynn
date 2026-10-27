@@ -257,18 +257,69 @@ fn parse(input: &str, last_status: i32) -> Result<Vec<Stage>, String> {
     Ok(stages)
 }
 
+// Keep command text intact so expansion happens after earlier commands have
+// updated the directory, environment, and exit status.
+fn and_commands(input: &str) -> Result<Vec<&str>, String> {
+    let mut commands = Vec::new();
+    let mut chars = input.char_indices().peekable();
+    let mut quote = None;
+    let mut start = 0;
+    while let Some((index, c)) = chars.next() {
+        match c {
+            '\\' if quote != Some('\'') => {
+                chars.next().ok_or("trailing escape")?;
+            }
+            '\'' | '"' if quote == Some(c) => quote = None,
+            '\'' | '"' if quote.is_none() => quote = Some(c),
+            '&' if quote.is_none() && chars.peek().is_some_and(|(_, c)| *c == '&') => {
+                chars.next();
+                let command = &input[start..index];
+                if command.trim().is_empty() || chars.peek().is_some_and(|(_, c)| *c == '&') {
+                    return Err("&& needs a command on both sides".into());
+                }
+                commands.push(command);
+                start = index + 2;
+            }
+            '&' if quote.is_none() => {
+                if input[..index].ends_with(['>', '<'])
+                    || chars.peek().is_some_and(|(_, c)| *c == '>')
+                {
+                    return Err("shell fd redirections require a shell; use zsh! command or bash! command".into());
+                }
+                return Err("background jobs (&) require an interactive shell; enter zsh! (or bash!), then run the command there. Jobs and shell state stay in that shell until you exit back to Lynn".into());
+            }
+            _ => {}
+        }
+    }
+    if quote.is_some() {
+        return Err("unclosed quote".into());
+    }
+    let command = &input[start..];
+    if command.trim().is_empty() && !commands.is_empty() {
+        return Err("&& needs a command on both sides".into());
+    }
+    commands.push(command);
+    Ok(commands)
+}
+
+pub fn validate_control_syntax(input: &str) -> Result<(), String> {
+    and_commands(input).map(|_| ())
+}
+
 /// Unquoted references in arguments or input redirections, in command order.
 pub fn reference_arguments(input: &str, last_status: i32) -> Result<Vec<String>, String> {
     let mut references = Vec::new();
-    for stage in parse(input, last_status)? {
-        references.extend(
-            stage
-                .reference_args
-                .iter()
-                .map(|&index| stage.args[index].clone()),
-        );
-        if stage.stdin_reference {
-            references.push(stage.stdin.unwrap());
+    for command in and_commands(input)? {
+        for stage in parse(command, last_status)? {
+            references.extend(
+                stage
+                    .reference_args
+                    .iter()
+                    .map(|&index| stage.args[index].clone()),
+            );
+            if stage.stdin_reference {
+                references.push(stage.stdin.unwrap());
+            }
         }
     }
     Ok(references)
@@ -432,6 +483,42 @@ fn owned_git_root(cwd: &Path) -> Option<PathBuf> {
     None
 }
 
+/// Hands the terminal to a normal interactive shell. Its state lasts until it
+/// exits and never changes Lynn's own directory or environment.
+pub fn enter_interactive(program: &str) -> Result<i32, String> {
+    let fd = io::stdin().as_raw_fd();
+    if unsafe { libc::isatty(fd) } != 1 {
+        return Err(format!(
+            "{program}!: an interactive shell requires a terminal; use {program}! command"
+        ));
+    }
+    let foreground = unsafe { libc::tcgetpgrp(fd) };
+    let mut original = unsafe { std::mem::zeroed() };
+    if foreground == -1 || unsafe { libc::tcgetattr(fd, &mut original) } == -1 {
+        return Err(io::Error::last_os_error().to_string());
+    }
+    println!("[entering {program}; exit or Ctrl-D returns to Lynn]");
+    io::stdout().flush().map_err(|error| error.to_string())?;
+    let mut command = Command::new(program);
+    command.arg("-i");
+    let status = crate::agent_cli::run_interactive(command, program);
+    // Interactive shells may establish their own foreground process group.
+    // Reclaim the terminal even if the shell was killed before restoring it.
+    unsafe {
+        let previous = libc::signal(libc::SIGTTOU, libc::SIG_IGN);
+        let group_error = (libc::tcsetpgrp(fd, foreground) == -1)
+            .then(io::Error::last_os_error);
+        let term_error = (libc::tcsetattr(fd, libc::TCSANOW, &original) == -1)
+            .then(io::Error::last_os_error);
+        libc::signal(libc::SIGTTOU, previous);
+        if let Some(error) = group_error.or(term_error) {
+            return Err(format!("{program}!: restoring terminal: {error}"));
+        }
+    }
+    println!("[returned to Lynn from {program}]");
+    Ok(status)
+}
+
 pub fn execute_host_shell(
     program: &str,
     script: &str,
@@ -476,6 +563,9 @@ pub fn execute_host_shell(
 }
 
 pub fn execute_substitution_shell(script: &str) -> Result<i32, String> {
+    // Command substitution must not silently opt into background job handling.
+    // An explicit bash!/zsh! command still delegates its entire script.
+    and_commands(script)?;
     let shell = std::env::var("SHELL").ok();
     let program = shell.as_deref().filter(|shell| {
         matches!(
@@ -500,6 +590,29 @@ pub fn execute(input: &str, last_status: i32) -> Result<Outcome, String> {
 }
 
 pub fn execute_with_references(
+    input: &str,
+    last_status: i32,
+    references: &BTreeMap<String, String>,
+) -> Result<Outcome, String> {
+    let commands = and_commands(input)?;
+    // Reject malformed chains before any command has side effects.
+    for command in &commands {
+        parse(command, last_status)?;
+    }
+    let mut status = last_status;
+    for command in commands {
+        match execute_pipeline(command, status, references)? {
+            Outcome::Status(next) => status = next,
+            exit @ Outcome::Exit(_) => return Ok(exit),
+        }
+        if status != 0 {
+            break;
+        }
+    }
+    Ok(Outcome::Status(status))
+}
+
+fn execute_pipeline(
     input: &str,
     last_status: i32,
     references: &BTreeMap<String, String>,
@@ -569,6 +682,22 @@ pub fn execute_with_references(
                 return Ok(Outcome::Status(0));
             }
             _ => {}
+        }
+        if args.len() == 1
+            && stages[0].reference_args.is_empty()
+            && stages[0].stdin.is_none()
+            && stages[0].stdout.is_none()
+            && stages[0].stderr.is_none()
+            && fish_directory_syntax(&args[0])
+            && Path::new(&args[0]).is_dir()
+        {
+            let target = args[0].clone();
+            let old = std::env::current_dir().map_err(|error| error.to_string())?;
+            std::env::set_current_dir(&target)
+                .map_err(|error| format!("{target}: {error}"))?;
+            std::env::set_var("OLDPWD", old);
+            std::env::set_var("PWD", std::env::current_dir().map_err(|error| error.to_string())?);
+            return Ok(Outcome::Status(0));
         }
         if args.len() == 1 {
             if let Some((key, value)) = args[0].split_once('=') {
@@ -686,6 +815,10 @@ pub fn execute_with_references(
     Ok(Outcome::Status(status))
 }
 
+fn fish_directory_syntax(command: &str) -> bool {
+    command.starts_with(['.', '/', '~']) || command.ends_with('/')
+}
+
 fn valid_name(name: &str) -> bool {
     let mut chars = name.chars();
     matches!(chars.next(), Some(c) if c.is_ascii_alphabetic() || c == '_')
@@ -724,6 +857,100 @@ mod tests {
 
     fn assert_status(result: Result<Outcome, String>, expected: i32) {
         assert!(matches!(result.unwrap(), Outcome::Status(status) if status == expected));
+    }
+
+    #[test]
+    fn and_chains_short_circuit_and_use_the_last_pipeline_status() {
+        let root = TestDirectory::new();
+        let output = root.file("output");
+        assert_status(execute(&format!("true&&echo hello > {output}"), 17), 0);
+        assert_eq!(
+            fs::read_to_string(root.0.join("output")).unwrap(),
+            "hello\n"
+        );
+        assert_status(
+            execute(&format!("false && echo skipped > {output} && true"), 0),
+            1,
+        );
+        assert_eq!(
+            fs::read_to_string(root.0.join("output")).unwrap(),
+            "hello\n"
+        );
+        assert_status(
+            execute(&format!("false | true && echo $? > {output}"), 17),
+            0,
+        );
+        assert_eq!(fs::read_to_string(root.0.join("output")).unwrap(), "0\n");
+        assert_status(
+            execute(&format!("true | false && echo skipped > {output}"), 0),
+            1,
+        );
+        assert_eq!(fs::read_to_string(root.0.join("output")).unwrap(), "0\n");
+        assert!(matches!(
+            execute("true && exit 7 && false", 0).unwrap(),
+            Outcome::Exit(7)
+        ));
+    }
+
+    #[test]
+    fn and_chains_preserve_literals_and_reject_bad_syntax_before_execution() {
+        assert_eq!(
+            and_commands(r#"echo 'a&&b' "c&&d" \&\& && true"#).unwrap(),
+            [r#"echo 'a&&b' "c&&d" \&\& "#, " true"]
+        );
+        let commands = and_commands("echo space\\ &&true").unwrap();
+        assert_eq!(parse(commands[0], 0).unwrap()[0].args, ["echo", "space "]);
+        let root = TestDirectory::new();
+        let output = root.file("output");
+        for suffix in [
+            "&&",
+            "&& && true",
+            "&&& true",
+            "&& echo |",
+            "&& echo 'unfinished",
+        ] {
+            assert!(execute(&format!("echo side-effect > {output} {suffix}"), 0).is_err());
+            assert!(!root.0.join("output").exists());
+        }
+        assert!(execute("&& true", 0).is_err());
+    }
+
+    #[test]
+    fn background_jobs_are_rejected_before_any_command_runs() {
+        let root = TestDirectory::new();
+        for suffix in [" &", "&", " && echo later &", " & echo later"] {
+            let input = format!("echo side-effect > {}{suffix}", root.file("output"));
+            let error = execute(&input, 0).err().unwrap();
+            assert!(error.contains("background jobs"));
+            assert!(error.contains("zsh!"));
+            assert!(!root.0.join("output").exists());
+            assert!(reference_arguments(&input, 0).is_err());
+        }
+        let input = format!("echo $(echo side-effect) > {} &", root.file("output"));
+        assert!(execute_substitution_shell(&input)
+            .unwrap_err()
+            .contains("background jobs"));
+        assert!(!root.0.join("output").exists());
+        for input in ["echo hello 2>&1", "echo hello &> output"] {
+            assert!(execute(input, 0).err().unwrap().contains("fd redirections"));
+        }
+    }
+
+    #[test]
+    fn and_chains_resolve_references_in_each_pipeline() {
+        let root = TestDirectory::new();
+        let references = BTreeMap::from([("#7".into(), "hello\n".into())]);
+        let input = format!(
+            "cat #7 > {} && cat < #7 >> {}",
+            root.file("output"),
+            root.file("output")
+        );
+        assert_eq!(reference_arguments(&input, 0).unwrap(), ["#7", "#7"]);
+        assert_status(execute_with_references(&input, 0, &references), 0);
+        assert_eq!(
+            fs::read_to_string(root.0.join("output")).unwrap(),
+            "hello\nhello\n"
+        );
     }
 
     #[test]

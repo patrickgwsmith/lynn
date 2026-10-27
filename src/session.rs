@@ -135,6 +135,7 @@ pub enum AgentModel {
     Luna,
     Terra,
     Pi,
+    Fx,
     Jsc,
 }
 
@@ -152,6 +153,7 @@ impl AgentModel {
             "luna" => Some(Self::Luna),
             "terra" => Some(Self::Terra),
             "pi" => Some(Self::Pi),
+            "fx" => Some(Self::Fx),
             "jsc" if cfg!(target_os = "macos") => Some(Self::Jsc),
             _ => None,
         }
@@ -170,6 +172,7 @@ impl AgentModel {
             Self::Luna => "luna",
             Self::Terra => "terra",
             Self::Pi => "pi",
+            Self::Fx => "fx",
             Self::Jsc => "jsc",
         }
     }
@@ -181,7 +184,7 @@ impl AgentModel {
             Self::Sol => Some("gpt-6-sol"),
             Self::Luna => Some("gpt-6-luna"),
             Self::Terra => Some("gpt-5.6-terra"),
-            Self::Fm | Self::Claude | Self::Codex | Self::Pi | Self::Jsc => None,
+            Self::Fm | Self::Claude | Self::Codex | Self::Pi | Self::Fx | Self::Jsc => None,
         }
     }
 
@@ -274,6 +277,7 @@ pub enum Event {
 pub enum Input<'a> {
     Help,
     Shell(&'a str),
+    InteractiveShell(&'static str),
     HostShell {
         program: &'static str,
         command: &'a str,
@@ -431,6 +435,10 @@ pub fn classify(line: &str) -> Input<'_> {
         )
     } else if let Some((model, access, task)) = agent_request(line) {
         agents(task, vec![model], AgentOptions::new(access))
+    } else if line.trim_end() == "bash!" {
+        Input::InteractiveShell("bash")
+    } else if line.trim_end() == "zsh!" {
+        Input::InteractiveShell("zsh")
     } else if let Some(command) = shell_target(line, "bash!") {
         Input::HostShell {
             program: "bash",
@@ -948,8 +956,8 @@ mod tests {
     }
 
     #[test]
-    fn codex_and_pi_questions_are_agent_requests() {
-        for name in ["codex", "pi"] {
+    fn codex_pi_and_fx_questions_are_agent_requests() {
+        for name in ["codex", "pi", "fx"] {
             let model = AgentModel::parse(name).unwrap();
             assert_eq!(
                 request(&format!("{name}? inspect this")),
@@ -1211,6 +1219,8 @@ mod tests {
 
     #[test]
     fn named_shell_commands_keep_their_script() {
+        assert!(matches!(classify("  bash!  "), Input::InteractiveShell("bash")));
+        assert!(matches!(classify("zsh!"), Input::InteractiveShell("zsh")));
         assert!(matches!(
             classify("bash! echo a | tr a b"),
             Input::HostShell {

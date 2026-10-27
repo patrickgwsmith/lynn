@@ -3,6 +3,7 @@ mod claude;
 mod codex;
 mod feed;
 mod fm;
+mod fx;
 mod http;
 mod inline;
 mod jsc;
@@ -736,6 +737,20 @@ fn handle(
                 status,
             });
         }
+        Input::InteractiveShell(program) => {
+            let status = match shell::enter_interactive(program) {
+                Ok(status) => status,
+                Err(error) => {
+                    eprintln!("lynn: {error}");
+                    1
+                }
+            };
+            session.last_status = status;
+            session.events.push(Event::Command {
+                input: format!("{program}!"),
+                status,
+            });
+        }
         Input::HostShell {
             program,
             command,
@@ -965,8 +980,9 @@ fn run_agent(
         (AgentModel::Pi, AgentOutput::Final) => {
             pi::run(task, cwd, context, access, user).map(Into::into)
         }
+        (AgentModel::Fx, AgentOutput::Final) => fx::run(request),
         (AgentModel::Jsc, AgentOutput::Final) => jsc::run(task, cwd, access, user).map(Into::into),
-        (AgentModel::Fm | AgentModel::Pi | AgentModel::Jsc, AgentOutput::Live) => {
+        (AgentModel::Fm | AgentModel::Pi | AgentModel::Fx | AgentModel::Jsc, AgentOutput::Live) => {
             Err("live status is unavailable for this agent".to_owned())
         }
     }
@@ -989,8 +1005,9 @@ fn interactive_agent(
             codex::interactive(cwd, model.backend_model(), access, effort)
         }
         AgentModel::Pi if effort == ReasoningEffort::Default => pi::interactive(cwd, access),
+        AgentModel::Fx if effort == ReasoningEffort::Default => fx::interactive(cwd, access),
         AgentModel::Jsc if effort == ReasoningEffort::Default => jsc::interactive(cwd, access),
-        AgentModel::Pi | AgentModel::Jsc => Err(
+        AgentModel::Pi | AgentModel::Fx | AgentModel::Jsc => Err(
             "extra reasoning effort is available only for Claude Code and Codex agents".to_owned(),
         ),
     }
@@ -1032,8 +1049,19 @@ fn resolve_inline(
     workers: &mut Workers,
 ) -> Result<String, String> {
     let Some(parts) = inline::parse(command)? else {
+        shell::validate_control_syntax(command)?;
         return Ok(command.to_owned());
     };
+    // Check before starting inline agents, but do not interpret their prompts
+    // as shell syntax. Each response will become one quoted argument.
+    let syntax: String = parts
+        .iter()
+        .map(|part| match part {
+            inline::Part::Literal(text) => *text,
+            inline::Part::Agent { .. } => "inline-agent-result",
+        })
+        .collect();
+    shell::validate_control_syntax(&syntax)?;
     let mut resolved = String::new();
     for part in parts {
         match part {
@@ -1115,7 +1143,12 @@ fn start_agents(request: AgentTask<'_>, session: &mut Session, workers: &mut Wor
     if options.effort != ReasoningEffort::Default
         && models
             .iter()
-            .any(|model| matches!(model, AgentModel::Fm | AgentModel::Pi | AgentModel::Jsc))
+            .any(|model| {
+                matches!(
+                    model,
+                    AgentModel::Fm | AgentModel::Pi | AgentModel::Fx | AgentModel::Jsc
+                )
+            })
     {
         eprintln!(
             "lynn: extra reasoning effort is available only for Claude Code and Codex agents"
@@ -1579,10 +1612,12 @@ fn print_help() {
         "  Output is shown to you, not shared with agents.",
         "  Agents see command input and exit status.",
         "  git status, cargo test, vim file   Run directly in the foreground",
+        "  cargo test && cargo build   Run the next command only after success",
         "  cat #3 #7 >> brief.md  Append numbered results to a file",
         "  diff #3.1 #3.2       Compare watch revisions as streamed inputs",
         "  cd, export, unset, exit; NAME=value are built-ins",
         "  reset                Clear session, history, watches, and request IDs",
+        "  bash!, zsh!         Enter an interactive shell; exit returns to Lynn",
         "  bash! command       Run a command through Bash as your user",
         "  zsh! command        Run a command through Zsh as your user",
         "  bash? command       Run Bash as staffer via sudo",
@@ -1618,6 +1653,8 @@ fn print_help() {
         "  🌙 task             Alias for luna? task",
         "  terra? task         Ask GPT-5.6 Terra through Codex (background)",
         "  pi? task            Ask Pi to inspect the project (background)",
+        "  fx? task            Ask fx to inspect the project (macOS, background)",
+        "  fx! task            Ask fx to change files (background)",
         "  🥧 task             Alias for pi? task",
         "  fm? task            Ask Apple Foundation Models to investigate (background)",
         "  🍎 task             Alias for fm? task",

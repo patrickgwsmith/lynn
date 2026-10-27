@@ -24,6 +24,7 @@ const READ_ONLY_HOME_WRITABLE: &[(&str, bool)] = &[
     (".claude.json", true),
     (".codex", false),
     (".pi", false),
+    (".fx", false),
     (".cache", false),
     ("Library/Caches", false),
 ];

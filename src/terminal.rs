@@ -275,7 +275,7 @@ impl Terminal {
                 }
                 9 => {
                     if let Ok(line) = std::str::from_utf8(&bytes) {
-                        let completion = completions(line, cursor);
+                        let completion = completions(line, cursor, &self.history);
                         if !completion.matches.is_empty() {
                             let replacement = if completion.matches.len() == 1 {
                                 completion.matches[0].clone()
@@ -860,7 +860,13 @@ fn unknown_command_span_in(line: &str, cwd: &Path, path: &OsStr) -> Option<(usiz
     let start = line.len() - line.trim_start().len();
     let rest = &line[start..];
     let end = rest
-        .find(|character: char| character.is_whitespace() || matches!(character, '|' | '<' | '>'))
+        .char_indices()
+        .find(|&(index, character)| {
+            character.is_whitespace()
+                || matches!(character, '|' | '<' | '>')
+                || rest[index..].starts_with("&&")
+        })
+        .map(|(index, _)| index)
         .unwrap_or(rest.len());
     let word = &rest[..end];
     if word.is_empty()
@@ -914,7 +920,7 @@ impl SelectorKind {
         match self {
             Self::Agent => "\x1b[1;35m",
             Self::ReaderShell => "\x1b[1;34m",
-            Self::HostShell => "\x1b[1;31m",
+            Self::HostShell => "\x1b[1;33m",
         }
     }
 }
@@ -961,7 +967,73 @@ struct Completion {
     matches: Vec<String>,
 }
 
-fn completions(line: &str, cursor: usize) -> Completion {
+fn write_access_request(line: &str) -> Option<String> {
+    let request = match crate::session::classify(line) {
+        crate::session::Input::Agents(request)
+            if request.options.access == crate::session::AgentAccess::ReadOnly
+                && request.models.len() == 1 => request,
+        _ => return None,
+    };
+    let start = if request.options.user == crate::agent_cli::AgentUser::Staffer {
+        let prefix = line.len() - line.trim_start().len();
+        let rest = &line[prefix + "@staffer".len()..];
+        prefix + "@staffer".len() + rest.len() - rest.trim_start().len()
+    } else {
+        line.len() - line.trim_start().len()
+    };
+    let end = start
+        + line[start..]
+            .find(char::is_whitespace)
+            .unwrap_or(line.len() - start);
+    let selector = &line[start..end];
+    if !selector.ends_with('?') {
+        return None;
+    }
+    Some(format!(
+        "{}{}{}",
+        &line[..start],
+        selector.replace('?', "!"),
+        &line[end..]
+    ))
+}
+
+fn history_completion(line: &str, cursor: usize, history: &[String]) -> Option<Completion> {
+    if cursor != 1 {
+        return None;
+    }
+    let replacement = match line {
+        "!" => write_access_request(history.last()?)?,
+        "?" => history.iter().rev().find_map(|entry| {
+            let models = match crate::session::classify(entry) {
+                crate::session::Input::Agents(request) if !request.models.is_empty() => {
+                    request.models
+                }
+                crate::session::Input::InteractiveAgent { model, .. } => vec![model],
+                crate::session::Input::EnterFm => vec![crate::session::AgentModel::Fm],
+                _ => return None,
+            };
+            Some(format!(
+                "{}?",
+                models
+                    .iter()
+                    .map(|model| model.name())
+                    .collect::<Vec<_>>()
+                    .join("/")
+            ))
+        })?,
+        _ => return None,
+    };
+    Some(Completion {
+        start: 0,
+        end: 1,
+        matches: vec![replacement],
+    })
+}
+
+fn completions(line: &str, cursor: usize, history: &[String]) -> Completion {
+    if let Some(completion) = history_completion(line, cursor, history) {
+        return completion;
+    }
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     completions_in(line, cursor, &cwd)
 }
@@ -1189,10 +1261,11 @@ fn common_prefix(strings: &[String]) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        backward_word, clear_editor, completions_in, forward_word, kill, normalize_paste,
-        prompt_for_display, selector_highlight, styled_input, unknown_command_span_in,
-        write_entered_input, write_input, write_notices, write_statuses_with_width, write_title,
-        write_wrapped, EditorDisplay, KillDirection, SelectorKind,
+        backward_word, clear_editor, completions_in, forward_word, history_completion, kill,
+        normalize_paste, prompt_for_display, selector_highlight, styled_input,
+        unknown_command_span_in, write_entered_input, write_input, write_notices,
+        write_statuses_with_width, write_title, write_wrapped, EditorDisplay, KillDirection,
+        SelectorKind,
     };
     use crate::session::DisplayDetail;
     use std::fs;
@@ -1305,7 +1378,7 @@ mod tests {
         assert_eq!(colored, b"+ \x1b[1;34mHEAD\x1b[0m https://example.com");
         colored.clear();
         write_input(&mut colored, "bash! rm file", true).unwrap();
-        assert_eq!(colored, b"\x1b[1;31mbash!\x1b[0m rm file");
+        assert_eq!(colored, b"\x1b[1;33mbash!\x1b[0m rm file");
         colored.clear();
         write_input(&mut colored, "@staffer opus? inspect", true).unwrap();
         assert_eq!(
@@ -1329,7 +1402,7 @@ mod tests {
         );
         assert_eq!(
             styled_input("  bash! command       Run Bash", true),
-            "  \x1b[1;31mbash!\x1b[0m command       Run Bash"
+            "  \x1b[1;33mbash!\x1b[0m command       Run Bash"
         );
         assert_eq!(styled_input("  opus? task", false), "  opus? task");
     }
@@ -1388,6 +1461,8 @@ mod tests {
 
         let lookup = |line| unknown_command_span_in(line, &root, root.as_os_str());
         assert_eq!(lookup("cat hello.txt"), None);
+        assert_eq!(lookup("cat&&echo hello"), None);
+        assert_eq!(lookup("dog&&echo hello"), Some((0, 3)));
         assert_eq!(lookup("  dog hello.txt"), Some((2, 5)));
         assert_eq!(lookup("./cat hello.txt"), None);
         assert_eq!(lookup("./dog hello.txt"), Some((0, 5)));
@@ -1396,6 +1471,82 @@ mod tests {
         assert_eq!(lookup("opus task"), Some((0, 4)));
         assert_eq!(lookup("# a note"), None);
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn bang_tab_recalls_the_last_read_only_request_with_write_access() {
+        for (previous, expected) in [
+            ("opus? explain this", "opus! explain this"),
+            (
+                "  sol??  inspect café\nthen explain  ",
+                "  sol!!  inspect café\nthen explain  ",
+            ),
+            ("luna??? inspect this", "luna!!! inspect this"),
+            ("@staffer opus? inspect", "@staffer opus! inspect"),
+        ] {
+            let history = vec![previous.to_owned()];
+            let completion = history_completion("!", 1, &history).unwrap();
+            assert_eq!((completion.start, completion.end), (0, 1));
+            assert_eq!(completion.matches, [expected]);
+        }
+    }
+
+    #[test]
+    fn bang_tab_requires_a_bare_bang_and_an_eligible_last_command() {
+        assert!(history_completion("!", 1, &[]).is_none());
+        let history = vec!["opus? inspect this".to_owned()];
+        for (line, cursor) in [("", 0), ("!", 0), ("! ", 2), ("!change", 1), ("echo !", 6)] {
+            assert!(history_completion(line, cursor, &history).is_none());
+        }
+        for previous in [
+            "ls",
+            "echo opus? inspect",
+            "opus! change",
+            "opus?! stream",
+            "opus?",
+            "opus/luna? compare",
+            "bash? pwd",
+        ] {
+            let history = vec!["opus? older request".to_owned(), previous.to_owned()];
+            assert!(history_completion("!", 1, &history).is_none());
+        }
+    }
+
+    #[test]
+    fn question_tab_recalls_the_latest_agent_without_its_instruction() {
+        for (previous, expected) in [
+            ("opus? explain this", "opus?"),
+            ("sol!!! implement this", "sol?"),
+            ("Opus?", "opus?"),
+            ("@staffer luna! implement this", "luna?"),
+            ("opus/luna?? compare", "opus/luna?"),
+            ("🎵 explain this", "opus?"),
+            ("fm?", "fm?"),
+        ] {
+            let history = vec![
+                "codex? older request".to_owned(),
+                previous.to_owned(),
+                "ls".to_owned(),
+            ];
+            let completion = history_completion("?", 1, &history).unwrap();
+            assert_eq!((completion.start, completion.end), (0, 1));
+            assert_eq!(completion.matches, [expected]);
+        }
+    }
+
+    #[test]
+    fn question_tab_requires_a_bare_question_and_agent_history() {
+        assert!(history_completion("?", 1, &[]).is_none());
+        let history = vec![
+            "ls".to_owned(),
+            "bash? pwd".to_owned(),
+            "# opus? explain".to_owned(),
+        ];
+        assert!(history_completion("?", 1, &history).is_none());
+        let history = vec!["opus? explain this".to_owned()];
+        for (line, cursor) in [("?", 0), ("? ", 2), ("?task", 1), ("echo ?", 6)] {
+            assert!(history_completion(line, cursor, &history).is_none());
+        }
     }
 
     #[test]

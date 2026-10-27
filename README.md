@@ -36,7 +36,7 @@ Lynn does not give full protection. Read [Limits of the protection](#limits-of-t
 
 - macOS or Linux.
 - Rust and Cargo, to install or build Lynn.
-- One or more agent CLIs, installed and authenticated: Claude Code, Codex, or Pi.
+- One or more agent CLIs, installed and authenticated: Claude Code, Codex, Pi, or fx.
 - Optional, on macOS: Apple's `fm` CLI, with its license accepted.
 
 ## Build and run
@@ -63,6 +63,7 @@ Lynn supports these agent names:
 | `claude`, `fable`, `opus`, `sonnet`, `haiku` | Claude Code |
 | `codex`, `sol`, `luna`, `terra` | Codex |
 | `pi` | Pi |
+| `fx` | fx (`fx?` requires macOS) |
 | `fm` | Apple Foundation Models (macOS only) |
 | `jsc` | JavaScriptCore shell (macOS only) |
 
@@ -82,7 +83,7 @@ Use `opus?! task` or `luna?! task` to give an agent write access and show live p
 
 You can paste a multiline request, including its `opus?` prefix, into the interactive prompt. Lynn keeps the pasted line breaks in one request; press Enter after pasting to send it.
 
-Enter an agent name with no request, for example `opus?` or `codex!`, to open that agent's own interactive CLI in the terminal. With `?` the session is read-only, using the same read-only tools and macOS sandbox as a `?` request. With `!` it can change files, using the same tools and sandbox settings as a `!` request. Bare `jsc?` or `jsc!` opens the jsc REPL, and bare `fm?` or `fm!` enters fm mode. When you exit the agent, you return to the Lynn prompt.
+Enter an agent name with no request, for example `opus?` or `codex!`, to open that agent's own interactive CLI in the terminal. With `?` the session is read-only, using the same read-only tools and macOS sandbox as a `?` request. With `!` it can change files, using the same tools and sandbox settings as a `!` request. Bare `fx?` or `fx!` opens fx interactively. Bare `jsc?` or `jsc!` opens the jsc REPL, and bare `fm?` or `fm!` enters fm mode. When you exit the agent, you return to the Lynn prompt.
 
 `jsc` is not a model: Lynn runs the request as JavaScript in the macOS JavaScriptCore shell and replies with what the script prints. Use `print()` for output, for example `jsc? print(6 * 7)`.
 
@@ -92,9 +93,10 @@ For a `?` request, Lynn uses these restrictions:
 
 - **Codex:** Lynn uses the Codex `read-only` sandbox. Lynn ignores your Codex user configuration, so an automatic approval setting cannot cancel read-only mode.
 - **Claude Code:** Lynn uses restricted mode and an explicit list of tools.
+- **fx:** `fx?` uses the macOS system sandbox to enforce read-only access; fx has no native read-only mode, so `fx?` is unavailable on Linux. `fx!` uses `fx ask --auto`, allowing edits subject to fx's automatic permission review. Background requests use `--no-save` and share Lynn's session context.
 - **Pi:** Lynn uses an explicit list of tools.
 - **fm:** Lynn controls the tools. The agent can list directories and read files in the current directory. It cannot write files or run commands.
-- **macOS system sandbox:** For Claude Code, Codex, Pi, and jsc, a macOS sandbox denies all file writes except to `/dev`, the temporary directories (`/tmp` and `/var/folders`), and the agent user's `~/.claude`, `~/.claude.json*`, `~/.codex`, `~/.pi`, `~/.cache`, and `~/Library/Caches`. This protects your project, its Git index, other repositories, and the rest of your home directory.
+- **macOS system sandbox:** For Claude Code, Codex, Pi, fx, and jsc, a macOS sandbox denies all file writes except to `/dev`, the temporary directories (`/tmp` and `/var/folders`), and the agent user's `~/.claude`, `~/.claude.json*`, `~/.codex`, `~/.pi`, `~/.fx`, `~/.cache`, and `~/Library/Caches`. This protects your project, its Git index, other repositories, and the rest of your home directory.
 
 For a `!` request, Codex uses its `workspace-write` sandbox. Other agents can write files and run commands.
 
@@ -134,7 +136,7 @@ Each request gets a label, for example `codex?#3` for read-only access or `opus!
 - When the answer is ready, Lynn shows `codex?#3: answer`.
 - Press Down at an empty prompt to show each running or queued request above its status line, and expand existing replies with their original requests and model details. Claude Code reports the model or models used in `modelUsage`, for example `opus?#3 [used claude-opus-5-5]: answer`. Codex does not report the actual model in its result events, so Lynn shows its explicitly requested model as unverified, for example `[requested gpt-6-luna; actual model unreported]`. Compact replies and `#3` recall omit this detail.
 - To show the latest completed agent reply, enter `#`. To show a specific full answer, enter `#3` or `codex?#3`. Older labels such as `codex#3` also work.
-- Claude, Codex, Pi, and fm read-only agents are asked for a concise one-line answer, preferably under 40 words, unless you explicitly request more detail or a structured answer. Lynn displays their replies without clipping; long lines wrap on screen.
+- Claude, Codex, Pi, fx, and fm read-only agents are asked for a concise one-line answer, preferably under 40 words, unless you explicitly request more detail or a structured answer. Lynn displays their replies without clipping; long lines wrap on screen.
 - To give an answer to a different agent, refer to it in the request. For example: `claude? do you agree with #3?`
 - If a request refers to an unfinished answer, Lynn queues it in the background, shows `waiting for #3`, and starts it when the answer arrives. A request with several references waits for all of them. Lynn builds the queued request's context after those answers enter the session log and includes each referenced answer once. If a referenced request fails, the queued request reports the failure.
 - Entering `#3` by itself while it is still running reports that it is still in progress.
@@ -205,13 +207,19 @@ Lynn runs these commands directly, without an LLM:
 - Commands from `PATH`, with arguments, quotes, and backslash escapes.
 - `$NAME` and `$?` expansion.
 - Pipelines and the redirections `<`, `>`, `>>`, `2>`, and `2>>`.
+- `&&` chains: `cargo test && cargo build` runs the build only if the tests succeed. Each command can be a pipeline. Built-in changes, such as `cd project && pwd`, apply to later commands in the chain.
+- Fish-style directory shorthand: enter a directory path such as `..`, `./project`, `/tmp`, or `project/` on its own to change into it. Bare names such as `project` remain commands.
 - Built-in commands: `cd`, `export NAME=value`, `unset NAME`, `NAME=value`, and `exit`.
+
+Lynn detects unquoted `&` and stops before running the line, with a suggestion to enter `zsh!` or `bash!`. Run background jobs inside that interactive shell, where `jobs`, `fg`, and `wait` share its job state. Directory changes, variables, and jobs belong to that shell; exiting returns to Lynn's own state. Quoted or escaped ampersands remain literal arguments. Explicit `bash! command` and `zsh! command` scripts are interpreted by their shell.
 
 At the interactive prompt, an unknown first command turns red as you type. Commands found in `PATH`, executable paths, and Lynn built-ins keep the normal color. For example, `opus` turns red if you meant to type `opus?`.
 
 If a command contains `$(...)`, Lynn runs the full command through Bash or Zsh. Lynn uses `$SHELL` if it is Bash or Zsh. If not, Lynn uses Zsh on macOS and Bash on Linux. Built-in commands such as `cd` in this shell do not change the directory of Lynn.
 
-To run a command through a specified shell, use `bash!` or `zsh!`:
+Enter `bash!` or `zsh!` alone to open a normal interactive shell. Within that shell, directory changes, variables, functions, and environment activation persist across commands, and you can enter multiline loops and conditionals. Type `exit` or press Ctrl-D to return to Lynn. The shell starts in Lynn's current directory; changes inside it do not change Lynn's directory or the environment used by agents. Its state ends when you leave it. Commands entered inside the shell are not added to Lynn's shared session; agents see only the shell entry and its exit status. This mode requires a terminal.
+
+To run a single command through a specified shell, use `bash!` or `zsh!` followed by the command:
 
 ```text
 bash! for f in *.rs; do wc -l "$f"; done
@@ -342,7 +350,7 @@ Colors help you see the access level before you press Enter:
 | Cyan | The prompt |
 | Magenta | Agent requests, for example `opus/luna?` and `codex!`, and the `fm?` mode label |
 | Blue | Commands as `staffer`: `bash?`, `zsh?`, and `@staffer` |
-| Red | Commands as you through a shell: `bash!` and `zsh!` |
+| Yellow | Commands as you through a shell: `bash!` and `zsh!` |
 
 Entered commands and agent requests appear in bold, while selector colors still show their access level. Expanded agent results show the original request in bold. Watched commands, for example `+ bash?`, use the same colors. Agent answers color the reply label, Markdown bold text, bullet marks, and inline code. To remove the colors, set `NO_COLOR=1`.
 
@@ -363,16 +371,20 @@ Editing keys:
 
 Tab completion accepts relative paths, absolute paths, and paths that start with `~/`. It adds escapes to spaces in names. Lynn also shows suggestions from your history as you type.
 
+Type `!` at an empty prompt and press Tab to recall the last command if it was a read-only agent request. For example, `opus? explain this` becomes `opus! explain this`, preserving the instruction. Repeated question marks become matching exclamation marks (`sol??` becomes `sol!!`). The recalled request stays in the editor until you press Enter. This shortcut uses only the most recent command and applies to requests for a single agent.
+
+Type `?` at an empty prompt and press Tab to recall the most recently used agent selector without its instruction, for example `opus?`. This searches back past ordinary commands and always uses read-only access with the default reasoning effort.
+
 ## Limits of the protection
 
 - The macOS sandbox still lets a `?` agent write to temporary directories and to the agent CLIs' own state and cache directories in the agent user's home directory.
-- On Linux, `?` requests use only the restrictions of each agent CLI. Lynn does not add a system sandbox.
+- On Linux, `fx?` is unavailable because fx has no native read-only mode. Other `?` requests use only the restrictions of each agent CLI. Lynn does not add a system sandbox.
 - `!` requests can change files and run commands.
 - `bash?`, `zsh?`, and `@staffer` have all the access of the `staffer` user.
 
 ## Other limits
 
-- Lynn does not support Bash control syntax, globbing, or persistence. Use `bash!` or `zsh!` for these.
+- Lynn's top-level command parser supports `&&`, but does not support other shell control syntax or globbing. Use `bash! command` or `zsh! command`, or enter `bash!` or `zsh!` alone for an interactive shell with state that persists until you exit it.
 - History and the session are in memory only. Lynn discards them when you exit.
 - Lynn reserves `?` and `!` without an agent name for a future default model.
 - Lynn recognizes all `name?` and `name!` forms as agent requests. If the agent is not available, Lynn shows an error and does not run a shell command. Names can contain letters, digits, underscores, hyphens, and periods. The `?` or `!` must be at the end of the first word.
