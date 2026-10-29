@@ -660,7 +660,12 @@ pub fn agent_reference(token: &str) -> Option<(&str, Option<AgentAccess>, usize)
 }
 
 pub fn agent_number_reference(token: &str) -> Option<usize> {
-    parse_agent_id(token.strip_prefix('#')?)
+    let number = token.strip_prefix('#')?;
+    // Six digits reads as a hex colour like #123456, not a reference.
+    if number.len() == 6 {
+        return None;
+    }
+    parse_agent_id(number)
 }
 
 pub fn watch_revision_reference(token: &str) -> Option<(usize, usize)> {
@@ -669,7 +674,10 @@ pub fn watch_revision_reference(token: &str) -> Option<(usize, usize)> {
 }
 
 fn parse_agent_id(number: &str) -> Option<usize> {
-    if number.is_empty() || !number.bytes().all(|byte| byte.is_ascii_digit()) {
+    if number.is_empty()
+        || number.starts_with('0')
+        || !number.bytes().all(|byte| byte.is_ascii_digit())
+    {
         return None;
     }
     let id = number.parse().ok()?;
@@ -901,6 +909,9 @@ mod tests {
         assert_eq!(agent_number_reference("#12"), Some(12));
         assert_eq!(agent_number_reference("#0"), None);
         assert_eq!(agent_number_reference("#3x"), None);
+        assert_eq!(agent_number_reference("#011627"), None);
+        assert_eq!(agent_number_reference("#123456"), None);
+        assert_eq!(agent_number_reference("#12345"), Some(12345));
         assert_eq!(watch_revision_reference("#3.2"), Some((3, 2)));
         assert_eq!(watch_revision_reference("#3.0"), None);
         assert!(matches!(
