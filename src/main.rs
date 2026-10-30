@@ -902,6 +902,7 @@ fn handle(
             println!("[fm read-only mode; ., exit, or Ctrl-C returns to the shell]");
         }
         Input::Agents(request) => start_agents(request, session, workers),
+        Input::Yes { id, access } => reply_yes(id, access, session, workers),
         Input::Url(url) => start_http(url, HttpRequestKind::Load, session, workers),
         Input::Head(url) => start_http(url, HttpRequestKind::Head, session, workers),
         Input::UnavailableTarget { name, access } => {
@@ -1672,6 +1673,8 @@ fn print_help() {
         "  echo $(date)        Run shell command substitution via Bash or Zsh",
         "  #3, codex?#3        Show a numbered result or full agent reply",
         "  #                   Show the latest completed agent reply",
+        "  yes, yes #3         Reply yes to the latest or a numbered agent reply",
+        "  yes!, yes! #3       Reply yes and let the agent change files",
         "  Down at empty prompt  Expand prompt, replies, and model details",
         "  claude? agree? #3   Include a numbered result; queue if an agent is still working",
     ] {
@@ -1851,6 +1854,45 @@ fn agent_response_by_id<'a>(
         agent_label_by_id(session, id).ok_or_else(|| format!("no reply found for #{id}"))?;
     let text = agent_response(session, label.model, id, workers)?;
     Ok((label, text))
+}
+
+/// Sends `yes #id` to the agent that wrote that answer, with the same model and options.
+/// `access` overrides the original access, as `yes!` does.
+fn reply_yes(
+    id: Option<usize>,
+    access: Option<AgentAccess>,
+    session: &mut Session,
+    workers: &mut Workers,
+) {
+    let label = match id {
+        Some(id) => agent_label_by_id(session, id),
+        None => latest_agent_response(session).map(|(label, _)| label),
+    };
+    let Some((model, id, options)) = label.and_then(|label| {
+        let options = AgentOptions {
+            effort: label.effort,
+            output: label.output,
+            ..AgentOptions::new(access.unwrap_or(label.access))
+        };
+        Some((AgentModel::parse(label.model)?, label.id, options))
+    }) else {
+        match id {
+            Some(id) => eprintln!("lynn: no reply found for #{id}"),
+            None => eprintln!("lynn: no agent reply yet"),
+        }
+        session.last_status = 1;
+        return;
+    };
+    let task = format!("yes #{id}");
+    start_agents(
+        AgentTask {
+            task: &task,
+            models: vec![model],
+            options,
+        },
+        session,
+        workers,
+    );
 }
 
 fn latest_agent_response(session: &Session) -> Option<(AgentLabel<'_>, &str)> {

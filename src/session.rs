@@ -297,6 +297,12 @@ pub enum Input<'a> {
     Head(&'a str),
     EnterFm,
     LatestAgentResponse,
+    /// `yes` replies to the latest agent answer; `yes #7` to answer 7.
+    /// `yes!` gives the reply read-write access.
+    Yes {
+        id: Option<usize>,
+        access: Option<AgentAccess>,
+    },
     AgentReference {
         model: &'a str,
         access: Option<AgentAccess>,
@@ -354,6 +360,8 @@ pub fn classify(line: &str) -> Input<'_> {
         Input::Help
     } else if line.trim_end() == "#" {
         Input::LatestAgentResponse
+    } else if let Some((id, access)) = yes_reply(line.trim_end()) {
+        Input::Yes { id, access }
     } else if line.trim_end() == "+" {
         Input::LiveDiff(DiffMode::Added)
     } else if line.trim_end() == "+-" {
@@ -516,6 +524,22 @@ pub fn classify(line: &str) -> Input<'_> {
     } else {
         Input::Shell(line)
     }
+}
+
+fn yes_reply(line: &str) -> Option<(Option<usize>, Option<AgentAccess>)> {
+    let (selector, rest) = line.split_once(' ').unwrap_or((line, ""));
+    let access = match selector {
+        "yes" => None,
+        "yes!" => Some(AgentAccess::ReadWrite),
+        _ => return None,
+    };
+    let rest = rest.trim();
+    let id = if rest.is_empty() {
+        None
+    } else {
+        Some(agent_number_reference(rest)?)
+    };
+    Some((id, access))
 }
 
 pub fn agents(task: &str, models: Vec<AgentModel>, options: AgentOptions) -> Input<'_> {
@@ -906,6 +930,29 @@ mod tests {
             Input::AgentNumberReference { id: 3 }
         ));
         assert!(matches!(classify("#"), Input::LatestAgentResponse));
+        assert!(matches!(
+            classify("yes"),
+            Input::Yes {
+                id: None,
+                access: None
+            }
+        ));
+        assert!(matches!(
+            classify("yes #7"),
+            Input::Yes {
+                id: Some(7),
+                access: None
+            }
+        ));
+        assert!(matches!(
+            classify("yes! #7"),
+            Input::Yes {
+                id: Some(7),
+                access: Some(AgentAccess::ReadWrite)
+            }
+        ));
+        assert!(matches!(classify("yesterday"), Input::Shell(_)));
+        assert!(matches!(classify("yes please"), Input::Shell(_)));
         assert_eq!(agent_number_reference("#12"), Some(12));
         assert_eq!(agent_number_reference("#0"), None);
         assert_eq!(agent_number_reference("#3x"), None);
