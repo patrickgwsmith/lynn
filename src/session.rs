@@ -1,7 +1,7 @@
 use crate::agent_cli::AgentUser;
 use crate::agent_cli::ModelInfo;
 use crate::shell::ShellExecution;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -14,15 +14,8 @@ pub struct Session {
     pub mode: PromptMode,
     pub detail: DisplayDetail,
     pub expanded_response_ids: BTreeSet<usize>,
-    pub agent_efforts: BTreeMap<usize, ReasoningEffort>,
-    pub model_details: BTreeMap<usize, ModelInfo>,
-    /// How long each agent took to reply, shown in expanded results.
-    pub agent_elapsed: BTreeMap<usize, Duration>,
-    pub streaming_agents: BTreeSet<usize>,
     /// The Pi model from the latest `pi.<model>?`, used by `pi?` and `pi!`.
     pub pi_model: Option<String>,
-    /// The Pi model each `pi` request ran with.
-    pub pi_models: BTreeMap<usize, String>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -278,11 +271,18 @@ pub enum Event {
         input: String,
         access: AgentAccess,
         model: Option<String>,
+        effort: ReasoningEffort,
+        output: AgentOutput,
+        /// The Pi model the request ran with, from `pi.<model>?`.
+        pi_model: Option<String>,
     },
     AgentResponse {
         id: usize,
         model: String,
         text: String,
+        model_info: Option<ModelInfo>,
+        /// How long the agent ran, not counting time queued.
+        elapsed: Option<Duration>,
     },
     Resource {
         id: usize,
@@ -361,12 +361,7 @@ impl Session {
             mode: PromptMode::Shell,
             detail: DisplayDetail::Compact,
             expanded_response_ids: BTreeSet::new(),
-            agent_efforts: BTreeMap::new(),
-            model_details: BTreeMap::new(),
-            agent_elapsed: BTreeMap::new(),
-            streaming_agents: BTreeSet::new(),
             pi_model: None,
-            pi_models: BTreeMap::new(),
         })
     }
 }

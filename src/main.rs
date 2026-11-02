@@ -123,19 +123,20 @@ impl<'a> AgentLabel<'a> {
 
     /// Applies the effort and live output recorded for this result.
     fn in_session(self, session: &Session) -> Self {
-        Self {
-            effort: session
-                .agent_efforts
-                .get(&self.id)
-                .copied()
-                .unwrap_or(ReasoningEffort::Default),
-            output: if session.streaming_agents.contains(&self.id) {
-                AgentOutput::Live
-            } else {
-                AgentOutput::Final
-            },
-            ..self
-        }
+        session
+            .events
+            .iter()
+            .find_map(|event| match event {
+                Event::AgentRequest {
+                    id, effort, output, ..
+                } if *id == self.id => Some(Self {
+                    effort: *effort,
+                    output: *output,
+                    ..self
+                }),
+                _ => None,
+            })
+            .unwrap_or(self)
     }
 }
 
@@ -227,13 +228,17 @@ fn render_session_agent(
     prompt: PromptLine,
 ) -> String {
     let label = label.in_session(session);
-    let (detail, elapsed) = if prompt == PromptLine::Always {
-        (
-            session.model_details.get(&label.id),
-            session.agent_elapsed.get(&label.id).copied(),
-        )
-    } else {
-        (None, None)
+    let (detail, elapsed) = match session.events.iter().find_map(|event| match event {
+        Event::AgentResponse {
+            id,
+            model_info,
+            elapsed,
+            ..
+        } if *id == label.id => Some((model_info.as_ref(), *elapsed)),
+        _ => None,
+    }) {
+        Some(details) if prompt == PromptLine::Always => details,
+        _ => (None, None),
     };
     let result = render_agent_with_models(label, display, Styling::Terminal, detail, elapsed);
     if prompt == PromptLine::WhenExpanded && !session.expanded_response_ids.contains(&label.id) {
@@ -262,9 +267,9 @@ fn expanded_agent_results(session: &mut Session) -> Vec<String> {
         .events
         .iter()
         .filter_map(|event| match event {
-            Event::AgentResponse { id, model, text }
-                if !session.expanded_response_ids.contains(id) =>
-            {
+            Event::AgentResponse {
+                id, model, text, ..
+            } if !session.expanded_response_ids.contains(id) => {
                 let label = agent_label_by_id(session, *id)?;
                 Some((
                     *id,
@@ -1210,6 +1215,11 @@ fn resolve_inline(
                     input: task.to_owned(),
                     access: AgentAccess::ReadOnly,
                     model: Some(model.to_owned()),
+                    effort: ReasoningEffort::Default,
+                    output: AgentOutput::Final,
+                    pi_model: (agent_model == AgentModel::Pi)
+                        .then(|| session.pi_model.clone())
+                        .flatten(),
                 });
                 println!(
                     "{}",
@@ -1237,14 +1247,12 @@ fn resolve_inline(
                 )
                 .map_err(|error| format!("{label}: {error}"))?;
                 let quoted = inline::quote_argument(&answer.text)?;
-                session.agent_elapsed.insert(id, started.elapsed());
-                if let Some(info) = answer.model_info {
-                    session.model_details.insert(id, info);
-                }
                 session.events.push(Event::AgentResponse {
                     id,
                     model: model.to_owned(),
                     text: answer.text.clone(),
+                    model_info: answer.model_info,
+                    elapsed: Some(started.elapsed()),
                 });
                 println!(
                     "{}",
@@ -1307,24 +1315,18 @@ fn start_agents(request: AgentTask<'_>, session: &mut Session, workers: &mut Wor
     for model in models {
         let id = workers.next_result_id();
         workers.active_agents += 1;
+        let backend_model = (model == AgentModel::Pi)
+            .then(|| session.pi_model.clone())
+            .flatten();
         session.events.push(Event::AgentRequest {
             id,
             input: task.into(),
             access: options.access,
             model: Some(model.name().to_owned()),
+            effort: options.effort,
+            output: options.output,
+            pi_model: backend_model.clone(),
         });
-        if options.effort != ReasoningEffort::Default {
-            session.agent_efforts.insert(id, options.effort);
-        }
-        let backend_model = (model == AgentModel::Pi)
-            .then(|| session.pi_model.clone())
-            .flatten();
-        if let Some(pi_model) = &backend_model {
-            session.pi_models.insert(id, pi_model.clone());
-        }
-        if options.output == AgentOutput::Live {
-            session.streaming_agents.insert(id);
-        }
         let request = QueuedAgent {
             id,
             model,
@@ -1939,13 +1941,16 @@ fn session_context_filtered(
                 input,
                 access,
                 model,
+                ..
             } => context.push_str(&format!(
                 "request ({}, {}): {input}\n",
                 AgentLabel::new(model.as_deref().unwrap_or("default"), *access, *id)
                     .in_session(session),
                 access.description()
             )),
-            Event::AgentResponse { id, model, text } => {
+            Event::AgentResponse {
+                id, model, text, ..
+            } => {
                 let label = agent_label_by_id(session, *id)
                     .map(|label| AgentLabel { model, ..label }.to_string())
                     .unwrap_or_else(|| format!("{model}#{id}"));
@@ -1991,6 +1996,7 @@ fn agent_response<'a>(
             id: response_id,
             model: response_model,
             text,
+            ..
         } if *response_id == id && response_model == model => Some(text.as_str()),
         _ => None,
     }) {
@@ -2054,8 +2060,16 @@ fn reply_yes(
     };
     let task = format!("yes #{id}");
     // Reply with the Pi model that answered, then restore the session's latest choice.
-    let latest_pi_model = match session.pi_models.get(&id) {
-        Some(pi_model) => session.pi_model.replace(pi_model.clone()),
+    let replied_pi_model = session.events.iter().find_map(|event| match event {
+        Event::AgentRequest {
+            id: request_id,
+            pi_model,
+            ..
+        } if *request_id == id => pi_model.clone(),
+        _ => None,
+    });
+    let latest_pi_model = match replied_pi_model {
+        Some(pi_model) => session.pi_model.replace(pi_model),
         None => session.pi_model.clone(),
     };
     start_agents(
@@ -2072,7 +2086,10 @@ fn reply_yes(
 
 fn latest_agent_response(session: &Session) -> Option<(AgentLabel<'_>, &str)> {
     session.events.iter().rev().find_map(|event| {
-        if let Event::AgentResponse { id, model, text } = event {
+        if let Event::AgentResponse {
+            id, model, text, ..
+        } = event
+        {
             agent_label_by_id(session, *id)
                 .map(|label| (AgentLabel { model, ..label }, text.as_str()))
         } else {
@@ -2524,10 +2541,6 @@ fn format_update(update: AgentUpdate, session: &mut Session, workers: &mut Worke
     let label = AgentLabel::new(&update.model, update.access, update.id).in_session(session);
     let line = match update.result {
         Ok(reply) => {
-            if let Some(info) = reply.model_info {
-                session.model_details.insert(update.id, info);
-            }
-            session.agent_elapsed.insert(update.id, update.elapsed);
             let display = match update.access {
                 AgentAccess::ReadOnly => AgentDisplay::Answer(&reply.text),
                 AgentAccess::ReadWrite => AgentDisplay::FullAnswer(&reply.text),
@@ -2537,6 +2550,8 @@ fn format_update(update: AgentUpdate, session: &mut Session, workers: &mut Worke
                 id: update.id,
                 model: update.model,
                 text: reply.text,
+                model_info: reply.model_info,
+                elapsed: Some(update.elapsed),
             });
             line
         }
@@ -2602,8 +2617,8 @@ mod tests {
         AgentDisplay, AgentLabel, AgentUpdate, PromptLine, ReferenceResolution, Styling, Workers,
     };
     use crate::session::{
-        AgentAccess, AgentModel, AgentOptions, AgentTask, DiffMode, DisplayDetail, Event,
-        PromptMode, ReasoningEffort, Session,
+        AgentAccess, AgentModel, AgentOptions, AgentOutput, AgentTask, DiffMode, DisplayDetail,
+        Event, PromptMode, ReasoningEffort, Session,
     };
     use crate::terminal::Terminal;
     use std::path::Path;
@@ -2620,6 +2635,9 @@ mod tests {
             input: "Keep mutating agents serial across all models".into(),
             access: AgentAccess::ReadWrite,
             model: Some("opus".into()),
+            effort: ReasoningEffort::Default,
+            output: AgentOutput::Final,
+            pi_model: None,
         });
         let reply = format!(
             "Earlier findings:\n{}\nEnd of earlier findings",
@@ -2629,6 +2647,8 @@ mod tests {
             id: 1,
             model: "opus".into(),
             text: reply.clone(),
+            model_info: None,
+            elapsed: None,
         });
         for number in 0..100 {
             session.events.push(Event::Command {
@@ -2742,6 +2762,9 @@ mod tests {
                 input: input.into(),
                 access: AgentAccess::ReadWrite,
                 model: Some(model.into()),
+                effort: ReasoningEffort::Default,
+                output: AgentOutput::Final,
+                pi_model: None,
             });
             workers.pending_agents.insert(id, status.into());
         }
@@ -2791,8 +2814,10 @@ mod tests {
             input: "Implement cancellation\nPreserve existing labels".into(),
             access: AgentAccess::ReadWrite,
             model: Some("opus".into()),
+            effort: ReasoningEffort::Default,
+            output: AgentOutput::Live,
+            pi_model: None,
         });
-        session.streaming_agents.insert(4);
         session.detail = DisplayDetail::Expanded;
         workers
             .pending_agents
@@ -2824,6 +2849,9 @@ mod tests {
             input: "first change".into(),
             access: AgentAccess::ReadWrite,
             model: Some("opus".into()),
+            effort: ReasoningEffort::Default,
+            output: AgentOutput::Final,
+            pi_model: None,
         });
         for model in [AgentModel::Opus, AgentModel::Sol] {
             start_agents(
@@ -2879,6 +2907,9 @@ mod tests {
             input: "research".into(),
             access: AgentAccess::ReadOnly,
             model: Some("opus".into()),
+            effort: ReasoningEffort::Default,
+            output: AgentOutput::Final,
+            pi_model: None,
         });
         for (model, task) in [
             (AgentModel::Opus, "implement #1"),
@@ -2919,6 +2950,9 @@ mod tests {
             input: "first change".into(),
             access: AgentAccess::ReadWrite,
             model: Some("opus".into()),
+            effort: ReasoningEffort::Default,
+            output: AgentOutput::Final,
+            pi_model: None,
         });
         for _ in 0..2 {
             start_agents(
@@ -2975,11 +3009,16 @@ mod tests {
             input: "inspect".into(),
             access: AgentAccess::ReadOnly,
             model: Some("opus".into()),
+            effort: ReasoningEffort::Default,
+            output: AgentOutput::Final,
+            pi_model: None,
         });
         session.events.push(Event::AgentResponse {
             id: 7,
             model: "opus".into(),
             text: "answer without a newline".into(),
+            model_info: None,
+            elapsed: None,
         });
         session.events.push(Event::HttpHead {
             id: 12,
@@ -3027,6 +3066,9 @@ mod tests {
             input: "inspect".into(),
             access: AgentAccess::ReadOnly,
             model: Some("opus".into()),
+            effort: ReasoningEffort::Default,
+            output: AgentOutput::Final,
+            pi_model: None,
         });
         workers.pending_agents.insert(7, "opus?#7: …".into());
         workers.active_agents = 1;
@@ -3053,6 +3095,9 @@ mod tests {
             input: "inspect".into(),
             access: AgentAccess::ReadOnly,
             model: Some("luna".into()),
+            effort: ReasoningEffort::Default,
+            output: AgentOutput::Final,
+            pi_model: None,
         });
         workers.pending_agents.insert(8, "luna?#8: …".into());
         workers.active_agents = 1;
@@ -3101,12 +3146,14 @@ mod tests {
     #[test]
     fn streamed_result_keeps_selector_in_final_and_recall() {
         let mut session = Session::new().unwrap();
-        session.streaming_agents.insert(1);
         session.events.push(Event::AgentRequest {
             id: 1,
             input: "Update the README".into(),
             access: AgentAccess::ReadWrite,
             model: Some("opus".into()),
+            effort: ReasoningEffort::Default,
+            output: AgentOutput::Live,
+            pi_model: None,
         });
         let mut workers = Workers::new(false);
         let final_line = format_update(
@@ -3140,6 +3187,9 @@ mod tests {
             input: "Inspect this".into(),
             access: AgentAccess::ReadOnly,
             model: Some("opus".into()),
+            effort: ReasoningEffort::Default,
+            output: AgentOutput::Final,
+            pi_model: None,
         });
         let mut workers = Workers::new(false);
         let line = format_update(
@@ -3180,6 +3230,9 @@ mod tests {
             input: "Inspect this".into(),
             access: AgentAccess::ReadOnly,
             model: Some("luna".into()),
+            effort: ReasoningEffort::Default,
+            output: AgentOutput::Final,
+            pi_model: None,
         });
         let mut workers = Workers::new(false);
         let line = format_update(
@@ -3335,11 +3388,16 @@ mod tests {
             input: "Inspect the parser".into(),
             access: AgentAccess::ReadOnly,
             model: Some("opus".into()),
+            effort: ReasoningEffort::Default,
+            output: AgentOutput::Final,
+            pi_model: None,
         });
         session.events.push(Event::AgentResponse {
             id: 1,
             model: "opus".into(),
             text: "Looks sound".into(),
+            model_info: None,
+            elapsed: None,
         });
         session.detail = DisplayDetail::Expanded;
         assert_eq!(
@@ -3353,6 +3411,9 @@ mod tests {
             input: "Check the tests".into(),
             access: AgentAccess::ReadOnly,
             model: Some("luna".into()),
+            effort: ReasoningEffort::Default,
+            output: AgentOutput::Final,
+            pi_model: None,
         });
         let mut workers = Workers::new(false);
         let output = format_update(
@@ -3385,12 +3446,14 @@ mod tests {
     #[test]
     fn reasoning_result_keeps_its_suffix_when_recalled() {
         let mut session = Session::new().unwrap();
-        session.agent_efforts.insert(3, ReasoningEffort::ExtraHigh);
         session.events.push(Event::AgentRequest {
             id: 3,
             input: "Inspect this".into(),
             access: AgentAccess::ReadOnly,
             model: Some("opus".into()),
+            effort: ReasoningEffort::ExtraHigh,
+            output: AgentOutput::Final,
+            pi_model: None,
         });
         let mut workers = Workers::new(false);
         assert_eq!(
@@ -3450,11 +3513,16 @@ mod tests {
             input: "inspect".into(),
             access: AgentAccess::ReadOnly,
             model: Some("codex".into()),
+            effort: ReasoningEffort::Default,
+            output: AgentOutput::Final,
+            pi_model: None,
         });
         session.events.push(Event::AgentResponse {
             id: 3,
             model: "codex".into(),
             text: "the full\nmultiline finding".into(),
+            model_info: None,
+            elapsed: None,
         });
         for _ in 0..25 {
             session.events.push(Event::Comment("later context".into()));
@@ -3477,11 +3545,16 @@ mod tests {
             input: "edit".into(),
             access: AgentAccess::ReadWrite,
             model: Some("opus".into()),
+            effort: ReasoningEffort::Default,
+            output: AgentOutput::Final,
+            pi_model: None,
         });
         session.events.push(Event::AgentResponse {
             id: 4,
             model: "opus".into(),
             text: "changed the file".into(),
+            model_info: None,
+            elapsed: None,
         });
         assert_eq!(
             ready_references("check opus!#4", &session, &workers)
@@ -3516,17 +3589,25 @@ mod tests {
             input: "first".into(),
             access: AgentAccess::ReadOnly,
             model: Some("sol".into()),
+            effort: ReasoningEffort::Default,
+            output: AgentOutput::Final,
+            pi_model: None,
         });
         session.events.push(Event::AgentRequest {
             id: 2,
             input: "second".into(),
             access: AgentAccess::ReadWrite,
             model: Some("opus".into()),
+            effort: ReasoningEffort::Default,
+            output: AgentOutput::Final,
+            pi_model: None,
         });
         session.events.push(Event::AgentResponse {
             id: 2,
             model: "opus".into(),
             text: "second finished first".into(),
+            model_info: None,
+            elapsed: None,
         });
         assert_eq!(
             latest_agent_response(&session),
@@ -3539,6 +3620,8 @@ mod tests {
             id: 1,
             model: "sol".into(),
             text: "first finished last".into(),
+            model_info: None,
+            elapsed: None,
         });
         assert_eq!(
             latest_agent_response(&session),
@@ -3558,6 +3641,9 @@ mod tests {
             input: "inspect".into(),
             access: AgentAccess::ReadOnly,
             model: Some("codex".into()),
+            effort: ReasoningEffort::Default,
+            output: AgentOutput::Final,
+            pi_model: None,
         });
         workers.pending_agents.insert(3, "codex?#3: …".into());
         assert_eq!(
@@ -3590,6 +3676,9 @@ mod tests {
             input: "inspect".into(),
             access: AgentAccess::ReadOnly,
             model: Some("sol".into()),
+            effort: ReasoningEffort::Default,
+            output: AgentOutput::Final,
+            pi_model: None,
         });
 
         start_agents(
@@ -3637,6 +3726,9 @@ mod tests {
                 input: "inspect".into(),
                 access: AgentAccess::ReadOnly,
                 model: Some("sol".into()),
+                effort: ReasoningEffort::Default,
+                output: AgentOutput::Final,
+                pi_model: None,
             });
             workers.pending_agents.insert(id, format!("sol?#{id}: …"));
         }
@@ -3650,6 +3742,8 @@ mod tests {
             id: 1,
             model: "sol".into(),
             text: "first".into(),
+            model_info: None,
+            elapsed: None,
         });
         assert!(matches!(
             resolve_references(task, &session, &workers).unwrap(),
@@ -3660,6 +3754,8 @@ mod tests {
             id: 2,
             model: "sol".into(),
             text: "second".into(),
+            model_info: None,
+            elapsed: None,
         });
         assert!(matches!(
             resolve_references(task, &session, &workers).unwrap(),
@@ -3679,6 +3775,9 @@ mod tests {
             input: "inspect".into(),
             access: AgentAccess::ReadOnly,
             model: Some("sol".into()),
+            effort: ReasoningEffort::Default,
+            output: AgentOutput::Final,
+            pi_model: None,
         });
         workers.pending_agents.insert(2, "sol?#2: …".into());
         start_agents(
@@ -3699,6 +3798,8 @@ mod tests {
             id: 2,
             model: "sol".into(),
             text: "unique reply".into(),
+            model_info: None,
+            elapsed: None,
         });
         workers.pending_agents.remove(&2);
         let ReferenceResolution::Ready(references) =
