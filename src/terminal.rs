@@ -953,7 +953,9 @@ fn selector_highlight(line: &str) -> Option<(usize, usize, SelectorKind)> {
                 .is_some_and(crate::session::is_agent_model)
             || selector
                 .strip_suffix('?')
-                .is_some_and(|names| names.split('/').all(crate::session::is_agent_model)))
+                .is_some_and(|names| names.split('/').all(crate::session::is_agent_model))
+            || crate::session::pi_model_selector(selector)
+                .is_some_and(|(_, suffix)| matches!(suffix, "?" | "!")))
     {
         SelectorKind::Agent
     } else {
@@ -1396,6 +1398,11 @@ mod tests {
             selector_highlight("codex! add LICENSE"),
             Some((0, 6, SelectorKind::Agent))
         );
+        assert_eq!(
+            selector_highlight("pi.qwen3.5-9b? hello"),
+            Some((0, 14, SelectorKind::Agent))
+        );
+        assert_eq!(selector_highlight("pi.qwen3.5-9b?? hello"), None);
         assert_eq!(
             selector_highlight("@staffer opus? LICENSE?"),
             Some((0, 8, SelectorKind::ReaderShell))
