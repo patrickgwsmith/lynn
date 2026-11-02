@@ -832,18 +832,24 @@ fn valid_name(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     struct TestDirectory(PathBuf);
 
     impl TestDirectory {
         fn new() -> Self {
+            // macOS clocks tick in microseconds, so parallel tests can read the same time.
+            static NEXT: AtomicUsize = AtomicUsize::new(0);
+            let count = NEXT.fetch_add(1, Ordering::Relaxed);
             let unique = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
                 .as_nanos();
-            let root = std::env::temp_dir()
-                .join(format!("lynn-reference-{}-{unique}", std::process::id()));
+            let root = std::env::temp_dir().join(format!(
+                "lynn-reference-{}-{unique}-{count}",
+                std::process::id()
+            ));
             fs::create_dir(&root).unwrap();
             Self(root)
         }
