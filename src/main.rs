@@ -906,10 +906,7 @@ fn handle(
         Input::Url(url) => start_http(url, HttpRequestKind::Load, session, workers),
         Input::Head(url) => start_http(url, HttpRequestKind::Head, session, workers),
         Input::UnavailableTarget { name, access } => {
-            eprintln!(
-                "lynn: target '{name}{}' is not available",
-                access.suffix()
-            );
+            eprintln!("lynn: target '{name}{}' is not available", access.suffix());
             session.last_status = 1;
         }
         Input::InteractiveAgent {
@@ -1142,14 +1139,12 @@ fn start_agents(request: AgentTask<'_>, session: &mut Session, workers: &mut Wor
         return;
     }
     if options.effort != ReasoningEffort::Default
-        && models
-            .iter()
-            .any(|model| {
-                matches!(
-                    model,
-                    AgentModel::Fm | AgentModel::Pi | AgentModel::Fx | AgentModel::Jsc
-                )
-            })
+        && models.iter().any(|model| {
+            matches!(
+                model,
+                AgentModel::Fm | AgentModel::Pi | AgentModel::Fx | AgentModel::Jsc
+            )
+        })
     {
         eprintln!(
             "lynn: extra reasoning effort is available only for Claude Code and Codex agents"

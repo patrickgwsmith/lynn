@@ -121,8 +121,7 @@ struct SchemaFile(PathBuf);
 impl SchemaFile {
     fn new(schema: &str) -> Result<Self, String> {
         let id = NEXT_SCHEMA.fetch_add(1, Ordering::Relaxed);
-        let path =
-            std::env::temp_dir().join(format!("lynn-fm-{}-{id}.json", std::process::id()));
+        let path = std::env::temp_dir().join(format!("lynn-fm-{}-{id}.json", std::process::id()));
         let mut file = OpenOptions::new()
             .write(true)
             .create_new(true)

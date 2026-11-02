@@ -284,7 +284,10 @@ fn and_commands(input: &str) -> Result<Vec<&str>, String> {
                 if input[..index].ends_with(['>', '<'])
                     || chars.peek().is_some_and(|(_, c)| *c == '>')
                 {
-                    return Err("shell fd redirections require a shell; use zsh! command or bash! command".into());
+                    return Err(
+                        "shell fd redirections require a shell; use zsh! command or bash! command"
+                            .into(),
+                    );
                 }
                 return Err("background jobs (&) require an interactive shell; enter zsh! (or bash!), then run the command there. Jobs and shell state stay in that shell until you exit back to Lynn".into());
             }
@@ -506,10 +509,9 @@ pub fn enter_interactive(program: &str) -> Result<i32, String> {
     // Reclaim the terminal even if the shell was killed before restoring it.
     unsafe {
         let previous = libc::signal(libc::SIGTTOU, libc::SIG_IGN);
-        let group_error = (libc::tcsetpgrp(fd, foreground) == -1)
-            .then(io::Error::last_os_error);
-        let term_error = (libc::tcsetattr(fd, libc::TCSANOW, &original) == -1)
-            .then(io::Error::last_os_error);
+        let group_error = (libc::tcsetpgrp(fd, foreground) == -1).then(io::Error::last_os_error);
+        let term_error =
+            (libc::tcsetattr(fd, libc::TCSANOW, &original) == -1).then(io::Error::last_os_error);
         libc::signal(libc::SIGTTOU, previous);
         if let Some(error) = group_error.or(term_error) {
             return Err(format!("{program}!: restoring terminal: {error}"));
@@ -693,10 +695,12 @@ fn execute_pipeline(
         {
             let target = args[0].clone();
             let old = std::env::current_dir().map_err(|error| error.to_string())?;
-            std::env::set_current_dir(&target)
-                .map_err(|error| format!("{target}: {error}"))?;
+            std::env::set_current_dir(&target).map_err(|error| format!("{target}: {error}"))?;
             std::env::set_var("OLDPWD", old);
-            std::env::set_var("PWD", std::env::current_dir().map_err(|error| error.to_string())?);
+            std::env::set_var(
+                "PWD",
+                std::env::current_dir().map_err(|error| error.to_string())?,
+            );
             return Ok(Outcome::Status(0));
         }
         if args.len() == 1 {

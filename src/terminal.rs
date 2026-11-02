@@ -971,7 +971,10 @@ fn write_access_request(line: &str) -> Option<String> {
     let request = match crate::session::classify(line) {
         crate::session::Input::Agents(request)
             if request.options.access == crate::session::AgentAccess::ReadOnly
-                && request.models.len() == 1 => request,
+                && request.models.len() == 1 =>
+        {
+            request
+        }
         _ => return None,
     };
     let start = if request.options.user == crate::agent_cli::AgentUser::Staffer {
@@ -1555,10 +1558,8 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let root = std::env::temp_dir().join(format!(
-            "lynn-completion-{}-{unique}",
-            std::process::id()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("lynn-completion-{}-{unique}", std::process::id()));
         fs::create_dir_all(root.join("My Docs")).unwrap();
         fs::write(root.join("report.txt"), "").unwrap();
         fs::write(root.join("My Docs").join("a b.txt"), "").unwrap();

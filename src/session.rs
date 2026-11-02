@@ -1277,7 +1277,10 @@ mod tests {
 
     #[test]
     fn named_shell_commands_keep_their_script() {
-        assert!(matches!(classify("  bash!  "), Input::InteractiveShell("bash")));
+        assert!(matches!(
+            classify("  bash!  "),
+            Input::InteractiveShell("bash")
+        ));
         assert!(matches!(classify("zsh!"), Input::InteractiveShell("zsh")));
         assert!(matches!(
             classify("bash! echo a | tr a b"),
