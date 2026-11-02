@@ -1,6 +1,7 @@
 use crate::agent_cli::AgentUser;
 use crate::agent_cli::ModelInfo;
 use crate::shell::ShellExecution;
+use indexmap::IndexMap;
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -240,6 +241,13 @@ pub enum LiveTarget {
     },
 }
 
+impl Resource {
+    /// Whether this resource was loaded from `url`, directly or through redirects.
+    pub fn answers(&self, url: &str) -> bool {
+        self.body_url == url || self.redirect_targets.contains_key(url)
+    }
+}
+
 impl LiveCommand {
     pub fn label(&self) -> String {
         match &self.target {
@@ -254,7 +262,11 @@ impl LiveCommand {
 }
 
 pub struct Resource {
-    pub url: String,
+    /// The URL whose response supplied the content; the base for relative links.
+    pub body_url: String,
+    /// Each URL that redirected, mapped to its destination, in the order followed.
+    /// Every key was reached from a URL the user entered, so lookups match keys too.
+    pub redirect_targets: IndexMap<String, String>,
     pub content_type: String,
     pub content: String,
 }

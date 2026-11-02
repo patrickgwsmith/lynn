@@ -15,6 +15,7 @@ mod shell;
 mod terminal;
 
 use agent_cli::{AgentReply, AgentUser, ModelInfo};
+use indexmap::IndexMap;
 use session::{
     AgentAccess, AgentModel, AgentOptions, AgentOutput, AgentTask, DiffMode, DisplayDetail, Event,
     FeedSelection, Input, LiveCommand, LiveTarget, PromptMode, ReasoningEffort, Resource, Session,
@@ -362,6 +363,8 @@ struct HttpRequest {
     id: usize,
     url: String,
     kind: HttpRequestKind,
+    /// URLs already answered by stored resources, so redirects to them are not refetched.
+    stored_urls: BTreeSet<String>,
 }
 
 #[derive(Clone, Copy)]
@@ -378,7 +381,15 @@ struct HttpUpdate {
 
 enum HttpResult {
     Resource(Resource),
-    Head { url: String, output: String },
+    /// The requested URL redirected to one an existing resource already answers.
+    Stored {
+        url: String,
+        redirect_targets: IndexMap<String, String>,
+    },
+    Head {
+        url: String,
+        output: String,
+    },
 }
 
 enum WorkerUpdate {
@@ -1603,7 +1614,9 @@ fn run_live_target(
         LiveTarget::Shell { program, command } => live::run(program, command, cwd),
         LiveTarget::Head { url } => http::head(client, url),
         LiveTarget::Feed { url, selection } => {
-            let resource = http::load(client, url)?;
+            let http::Loaded::Resource(resource) = http::load(client, url, &|_| false)? else {
+                unreachable!("nothing is stored for watched feeds");
+            };
             if *selection == FeedSelection::ContentType
                 && !feed::is_feed_content_type(&resource.content_type)
             {
@@ -1707,6 +1720,10 @@ fn start_http(url: &str, kind: HttpRequestKind, session: &mut Session, workers: 
         }
     };
     let id = workers.next_result_id();
+    let stored_urls = match kind {
+        HttpRequestKind::Load => stored_resource_urls(session),
+        HttpRequestKind::Head => BTreeSet::new(),
+    };
     let sender = workers.hosts.entry(origin).or_insert_with(|| {
         let (sender, receiver) = mpsc::channel::<HttpRequest>();
         let updates = workers.worker_tx.clone();
@@ -1721,7 +1738,19 @@ fn start_http(url: &str, kind: HttpRequestKind, session: &mut Session, workers: 
                         })
                     }
                     HttpRequestKind::Load => {
-                        http::load(&client, &request.url).map(HttpResult::Resource)
+                        let stored_urls = request.stored_urls;
+                        http::load(&client, &request.url, &|url| stored_urls.contains(url)).map(
+                            |loaded| match loaded {
+                                http::Loaded::Resource(resource) => HttpResult::Resource(resource),
+                                http::Loaded::Stored {
+                                    url,
+                                    redirect_targets,
+                                } => HttpResult::Stored {
+                                    url,
+                                    redirect_targets,
+                                },
+                            },
+                        )
                     }
                 };
                 if updates
@@ -1743,6 +1772,7 @@ fn start_http(url: &str, kind: HttpRequestKind, session: &mut Session, workers: 
             id,
             url: url.to_owned(),
             kind,
+            stored_urls,
         })
         .is_err()
     {
@@ -1959,7 +1989,8 @@ fn session_context_filtered(
             Event::Resource { id, resource } => {
                 context.push_str(&format!(
                     "resource: {} ({})\n",
-                    resource.url, resource.content_type
+                    resource_label(resource),
+                    resource.content_type
                 ));
                 let mut content = resource.content.chars();
                 context.extend(content.by_ref().take(8_000));
@@ -2123,7 +2154,9 @@ fn http_response_by_id(session: &Session, id: usize) -> Option<String> {
             resource,
         } if *event_id == id => Some(format!(
             "{} ({}):\n{}",
-            resource.url, resource.content_type, resource.content
+            resource_label(resource),
+            resource.content_type,
+            resource.content
         )),
         _ => None,
     })
@@ -2139,12 +2172,41 @@ fn task_urls(task: &str) -> impl Iterator<Item = &str> {
     })
 }
 
-/// The latest stored GET result for this URL.
+/// The latest stored GET result for this URL, including URLs that redirected to it.
 fn stored_resource_id(session: &Session, url: &str) -> Option<usize> {
     session.events.iter().rev().find_map(|event| match event {
-        Event::Resource { id, resource } if resource.url == url => Some(*id),
+        Event::Resource { id, resource } if resource.answers(url) => Some(*id),
         _ => None,
     })
+}
+
+/// Every URL a stored GET result answers.
+fn stored_resource_urls(session: &Session) -> BTreeSet<String> {
+    let mut urls = BTreeSet::new();
+    for event in &session.events {
+        if let Event::Resource { resource, .. } = event {
+            urls.insert(resource.body_url.clone());
+            urls.extend(resource.redirect_targets.keys().cloned());
+        }
+    }
+    urls
+}
+
+/// The body URL, preceded by the redirects that led to it, e.g. `A → B → C`.
+fn resource_label(resource: &Resource) -> String {
+    let mut label = String::new();
+    for (from, to) in &resource.redirect_targets {
+        if label.is_empty() {
+            label.push_str(from);
+        } else if !label.ends_with(from.as_str()) {
+            label.push_str(&format!("; {from}"));
+        }
+        label.push_str(&format!(" → {to}"));
+    }
+    if label.is_empty() {
+        label.push_str(&resource.body_url);
+    }
+    label
 }
 
 fn watch_response_by_id(session: &Session, id: usize, revision: Option<usize>) -> Option<String> {
@@ -2494,7 +2556,7 @@ fn format_worker_update(
                     let message = format!(
                         "GET#{} {} ({} {} bytes): …",
                         update.id,
-                        resource.url,
+                        resource_label(&resource),
                         resource.content_type,
                         resource.content.len()
                     );
@@ -2504,6 +2566,41 @@ fn format_worker_update(
                         resource,
                     });
                     Some(message)
+                }
+                Ok(HttpResult::Stored {
+                    url,
+                    redirect_targets,
+                }) => {
+                    workers.pending_http.remove(&update.id);
+                    let requested = redirect_targets.keys().next().cloned().unwrap_or_default();
+                    let stored = session
+                        .events
+                        .iter_mut()
+                        .rev()
+                        .find_map(|event| match event {
+                            Event::Resource { id, resource } if resource.answers(&url) => {
+                                Some((*id, resource))
+                            }
+                            _ => None,
+                        });
+                    match stored {
+                        Some((id, resource)) => {
+                            for (from, to) in redirect_targets {
+                                resource.redirect_targets.entry(from).or_insert(to);
+                            }
+                            Some(format!(
+                                "GET#{} {requested} redirects to {url}, already loaded as #{id}",
+                                update.id
+                            ))
+                        }
+                        None => {
+                            session.last_status = 1;
+                            Some(format!(
+                                "GET#{} error: {requested} redirects to {url}, which is no longer stored",
+                                update.id
+                            ))
+                        }
+                    }
                 }
                 Ok(HttpResult::Head { url, output }) => {
                     let status = output.lines().next().unwrap_or("HTTP response");
@@ -2692,7 +2789,8 @@ mod tests {
         session.events.push(Event::Resource {
             id: 3,
             resource: crate::session::Resource {
-                url: "https://example.com/large".into(),
+                body_url: "https://example.com/large".into(),
+                redirect_targets: Default::default(),
                 content_type: "text/plain".into(),
                 content: format!("{}TAIL_OF_PAGE", "α".repeat(9_000)),
             },
@@ -2728,7 +2826,8 @@ mod tests {
         session.events.push(Event::Resource {
             id: 2,
             resource: crate::session::Resource {
-                url: url.into(),
+                body_url: url.into(),
+                redirect_targets: Default::default(),
                 content_type: "text/plain".into(),
                 content: format!("{}TAIL_OF_PAGE", "β".repeat(9_000)),
             },
@@ -2738,6 +2837,47 @@ mod tests {
         assert!(references.text.contains("Referenced HTTP result #2"));
         assert!(references.text.contains("TAIL_OF_PAGE"));
         assert_eq!(super::stored_resource_id(&session, url), Some(2));
+        // URLs that redirected to a stored result find it too.
+        session.events.push(Event::Resource {
+            id: 4,
+            resource: crate::session::Resource {
+                body_url: "https://raw.example.com/c".into(),
+                redirect_targets: [
+                    (
+                        "https://example.com/a".into(),
+                        "https://example.com/b".into(),
+                    ),
+                    (
+                        "https://example.com/b".into(),
+                        "https://raw.example.com/c".into(),
+                    ),
+                    (
+                        "https://example.com/d".into(),
+                        "https://example.com/b".into(),
+                    ),
+                ]
+                .into_iter()
+                .collect(),
+                content_type: "text/plain".into(),
+                content: "C".into(),
+            },
+        });
+        for url in ["a", "b", "d"] {
+            let url = format!("https://example.com/{url}");
+            assert_eq!(super::stored_resource_id(&session, &url), Some(4));
+        }
+        assert_eq!(
+            super::stored_resource_id(&session, "https://raw.example.com/c"),
+            Some(4)
+        );
+        let Some(Event::Resource { resource, .. }) = session.events.last() else {
+            unreachable!()
+        };
+        assert_eq!(
+            super::resource_label(resource),
+            "https://example.com/a → https://example.com/b → https://raw.example.com/c; https://example.com/d → https://example.com/b"
+        );
+        assert!(super::stored_resource_urls(&session).contains("https://example.com/d"));
         // A fragment in a URL is not a reference, and unknown URLs are left to the agent.
         let references =
             ready_references("read https://example.com/#3 too", &session, &workers).unwrap();

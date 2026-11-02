@@ -334,7 +334,7 @@ Lynn keeps these items in the session, and agents can see them:
 
 Enter `-` alone to show the current TODO list.
 
-Lynn does not follow redirects. It shows the new URL. To load that page, enter the new URL.
+Because you entered the URL, Lynn follows up to 5 redirects, including ones to other hosts, as long as each destination is HTTP or HTTPS. The page is stored once. Every URL in the redirect chain finds it, so a later request for any of them reuses the stored copy. If a new URL redirects to a page Lynn already has, Lynn stops there and adds the new redirect to that page instead of loading it again. Redirect loops and chains longer than 5 are reported as errors.
 
 Enter `HEAD https://...` to show the response headers and the time to receive them. Enter `+ HEAD https://...` to register a HEAD watch, then enter `+` when you want to refresh it and compare results. Lynn does not (yet) show separate DNS, TCP, and TLS times.
 

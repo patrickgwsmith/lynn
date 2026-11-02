@@ -239,7 +239,8 @@ mod tests {
     #[test]
     fn atom_entries_render_and_diff_without_reorder_noise() {
         let resource = Resource {
-            url: "https://example.com/commits.atom".into(),
+            body_url: "https://example.com/commits.atom".into(),
+            redirect_targets: Default::default(),
             content_type: "application/atom+xml; charset=utf-8".into(),
             content: r#"<?xml version="1.0"?><feed xmlns="http://www.w3.org/2005/Atom"><entry><id>tag:example,1</id><title>Fix &amp; test</title><link href="https://example.com/1"/></entry><entry><id>tag:example,2</id><title>Other</title><link rel="alternate" href="https://example.com/2"/></entry></feed>"#.into(),
         };
@@ -266,7 +267,8 @@ mod tests {
     #[test]
     fn rss_items_render_and_diff_with_entities_and_cdata() {
         let resource = Resource {
-            url: "https://static.crates.io/rss/updates.xml".into(),
+            body_url: "https://static.crates.io/rss/updates.xml".into(),
+            redirect_targets: Default::default(),
             content_type: "text/xml; charset=utf-8".into(),
             content: r#"<?xml version="1.0"?><rss version="2.0"><channel><title>Crates.io updates</title><item><title>serde &amp; friends 1.0</title><link>https://crates.io/crates/serde/1.0</link><guid>serde-1.0</guid></item><item><title><![CDATA[quick xml 2.0]]></title><guid>https://crates.io/crates/quick-xml/2.0</guid></item><item><title>Title only</title><guid isPermaLink="false">opaque-id</guid></item></channel></rss>"#.into(),
         };
@@ -290,7 +292,8 @@ mod tests {
     #[test]
     fn rejects_non_feed_xml_and_rss_without_channel() {
         let mut resource = Resource {
-            url: "https://example.com/other.xml".into(),
+            body_url: "https://example.com/other.xml".into(),
+            redirect_targets: Default::default(),
             content_type: "text/xml".into(),
             content: "<html><title>Not a feed</title></html>".into(),
         };
