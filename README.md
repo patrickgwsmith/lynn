@@ -77,6 +77,17 @@ For a short read-only request, use `🎵 task` or `🎶 task` for `opus? task`, 
 
 `Opus? task` also works as `opus? task`.
 
+### Choose a Pi model
+
+Pi can run any model in its own configuration, including local models such as Qwen served by Kapitsa or llama.cpp. Lynn does not keep a list of Pi models, so a new model in Pi needs no new Lynn release. Choose the model the first time you use Pi in a session:
+
+```text
+pi.qwen3.5-9b? which tests cover the parser?
+pi! rename parse_line to parse_input
+```
+
+Type `pi` and press Tab to list Pi's models; Lynn runs `pi --list-models` each time. `pi.<model>?` and `pi.<model>!` use that model and remember it, so later `pi?`, `pi!`, `🥧`, and `opus/pi?` requests use it too. If you enter `pi?` or `pi!` before choosing a model, Lynn lists Pi's models and asks you to enter a number or a model name; press Enter to cancel. When input is not a terminal, Lynn reports an error instead. Lynn never falls back to Pi's own default model. Use `provider/model` when two providers have a model with the same name, for example `pi.kapitsa/qwen3.5-9b?`. `yes #n` reuses the model that wrote #n. Expanded replies show the model as `[requested kapitsa/qwen3.5-9b; actual model unreported]`. `@staffer pi?` runs Pi as staffer, which uses staffer's own Pi configuration.
+
 Repeat the final `?` or `!` to request more reasoning from Claude Code or Codex agents. `opus?? task` and `sol!! task` request `xhigh`; `opus??? task` and `sol!!! task` request `max`. `?` remains read-only and `!` retains write access. A single suffix uses the agent's normal effort setting. This also works with a read-only group, such as `opus/luna?? task`, or with a bare interactive selector such as `opus??`. Lynn shows the requested suffix in each result label, for example `opus??#3`. The selected model or your provider settings may limit the actual effort; if the provider rejects the requested level, Lynn reports its error.
 
 Use `opus?! task` or `luna?! task` to give an agent write access and show live progress while it works. Lynn updates the pending line from Claude Code's or Codex's streamed events, then records the complete final answer as `opus?!#n` or `luna?!#n`. This works with all Claude Code and Codex model names. The stream is shown only in the terminal; the shared session stores the final answer.

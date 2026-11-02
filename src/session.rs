@@ -17,6 +17,10 @@ pub struct Session {
     pub agent_efforts: BTreeMap<usize, ReasoningEffort>,
     pub model_details: BTreeMap<usize, ModelInfo>,
     pub streaming_agents: BTreeSet<usize>,
+    /// The Pi model from the latest `pi.<model>?`, used by `pi?` and `pi!`.
+    pub pi_model: Option<String>,
+    /// The Pi model each `pi` request ran with.
+    pub pi_models: BTreeMap<usize, String>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -342,6 +346,8 @@ impl Session {
             agent_efforts: BTreeMap::new(),
             model_details: BTreeMap::new(),
             streaming_agents: BTreeSet::new(),
+            pi_model: None,
+            pi_models: BTreeMap::new(),
         })
     }
 }
@@ -524,6 +530,13 @@ pub fn classify(line: &str) -> Input<'_> {
     } else {
         Input::Shell(line)
     }
+}
+
+/// `pi.<model>? task` chooses Pi's model: returns the model and the line from `?` or `!` on.
+pub fn pi_model_selector(line: &str) -> Option<(&str, &str)> {
+    let rest = line.trim_start().strip_prefix("pi.")?;
+    let (model, selector) = rest.split_at(rest.find(['?', '!'])?);
+    (!model.is_empty() && !model.contains(char::is_whitespace)).then_some((model, selector))
 }
 
 fn yes_reply(line: &str) -> Option<(Option<usize>, Option<AgentAccess>)> {
@@ -745,8 +758,9 @@ fn shell_target<'a>(line: &'a str, prefix: &str) -> Option<&'a str> {
 #[cfg(test)]
 mod tests {
     use super::{
-        agent_number_reference, agent_reference, classify, watch_revision_reference, AgentAccess,
-        AgentModel, AgentOptions, AgentOutput, AgentTask, DiffMode, Input, ReasoningEffort,
+        agent_number_reference, agent_reference, classify, pi_model_selector,
+        watch_revision_reference, AgentAccess, AgentModel, AgentOptions, AgentOutput, AgentTask,
+        DiffMode, Input, ReasoningEffort,
     };
     use crate::agent_cli::AgentUser;
     use crate::shell::ShellExecution;
@@ -952,6 +966,17 @@ mod tests {
             }
         ));
         assert!(matches!(classify("yesterday"), Input::Shell(_)));
+        assert_eq!(
+            pi_model_selector("pi.qwen3.5-9b? why"),
+            Some(("qwen3.5-9b", "? why"))
+        );
+        assert_eq!(
+            pi_model_selector("pi.kapitsa/qwen3.5-9b!"),
+            Some(("kapitsa/qwen3.5-9b", "!"))
+        );
+        assert_eq!(pi_model_selector("pi? why"), None);
+        assert_eq!(pi_model_selector("pi.? why"), None);
+        assert_eq!(pi_model_selector("pi.a b? why"), None);
         assert!(matches!(classify("yes please"), Input::Shell(_)));
         assert_eq!(agent_number_reference("#12"), Some(12));
         assert_eq!(agent_number_reference("#0"), None);

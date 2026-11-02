@@ -1066,6 +1066,14 @@ fn completions_in(line: &str, cursor: usize, cwd: &Path) -> Completion {
                 names.insert(render_completion(built_in, style, false));
             }
         }
+        if value == "pi" || value.starts_with("pi.") {
+            // Listed on each Tab so new Pi models need no new Lynn release.
+            for selector in pi_model_selectors(&crate::pi::models()) {
+                if selector.starts_with(&value) {
+                    names.insert(render_completion(&selector, style, false));
+                }
+            }
+        }
         for model in [
             "claude", "fable", "opus", "Opus", "sonnet", "haiku", "codex", "sol", "luna", "terra",
         ] {
@@ -1133,6 +1141,21 @@ fn completions_in(line: &str, cursor: usize, cwd: &Path) -> Completion {
         end,
         matches: names.into_iter().collect(),
     }
+}
+
+/// `pi.<id>?` and `pi.<id>!` for each Pi model, with the provider only where IDs clash.
+fn pi_model_selectors(models: &[String]) -> Vec<String> {
+    let id = |model: &str| model.split_once('/').map_or(model, |(_, id)| id).to_owned();
+    let mut selectors = Vec::new();
+    for model in models {
+        let name = if models.iter().filter(|other| id(other) == id(model)).count() == 1 {
+            id(model)
+        } else {
+            model.clone()
+        };
+        selectors.extend(["?", "!"].map(|suffix| format!("pi.{name}{suffix}")));
+    }
+    selectors
 }
 
 fn completion_token(prefix: &str) -> (usize, String, Option<char>, Option<char>, bool) {
@@ -1265,7 +1288,7 @@ fn common_prefix(strings: &[String]) -> String {
 mod tests {
     use super::{
         backward_word, clear_editor, completions_in, forward_word, history_completion, kill,
-        normalize_paste, prompt_for_display, selector_highlight, styled_input,
+        normalize_paste, pi_model_selectors, prompt_for_display, selector_highlight, styled_input,
         unknown_command_span_in, write_entered_input, write_input, write_notices,
         write_statuses_with_width, write_title, write_wrapped, EditorDisplay, KillDirection,
         SelectorKind,
@@ -1274,6 +1297,22 @@ mod tests {
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn pi_selectors_add_the_provider_only_for_clashing_ids() {
+        let models = ["kapitsa/qwen3.5-9b", "a/shared", "b/shared"].map(String::from);
+        assert_eq!(
+            pi_model_selectors(&models),
+            [
+                "pi.qwen3.5-9b?",
+                "pi.qwen3.5-9b!",
+                "pi.a/shared?",
+                "pi.a/shared!",
+                "pi.b/shared?",
+                "pi.b/shared!",
+            ]
+        );
+    }
 
     #[test]
     fn terminal_title_uses_short_path_and_filters_control_sequences() {

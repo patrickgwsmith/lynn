@@ -48,6 +48,8 @@ struct QueuedAgent {
     task: String,
     cwd: PathBuf,
     options: AgentOptions,
+    /// Overrides the agent's own backend model, as `pi.<model>?` does.
+    backend_model: Option<String>,
 }
 
 impl QueuedAgent {
@@ -678,6 +680,15 @@ fn handle(
     if session.mode == PromptMode::FmReadOnly && line.trim().is_empty() {
         return None;
     }
+    let chosen_pi;
+    let line = match session::pi_model_selector(line) {
+        Some((model, selector)) if session.mode == PromptMode::Shell => {
+            session.pi_model = Some(model.to_owned());
+            chosen_pi = format!("pi{selector}");
+            chosen_pi.as_str()
+        }
+        _ => line,
+    };
     let classified = session::classify(line);
     let input = if session.mode == PromptMode::FmReadOnly
         && !matches!(
@@ -695,6 +706,14 @@ fn handle(
     } else {
         classified
     };
+    let wants_pi = match &input {
+        Input::Agents(request) => request.models.contains(&AgentModel::Pi),
+        Input::InteractiveAgent { model, .. } => *model == AgentModel::Pi,
+        _ => false,
+    };
+    if wants_pi && session.pi_model.is_none() && workers.interactive && !choose_pi_model(session) {
+        return None;
+    }
     match input {
         Input::Help => print_help(),
         Input::Shell(command) => {
@@ -943,6 +962,7 @@ fn run_agent(
         task,
         cwd,
         context,
+        model: backend_model,
         access,
         user,
         ..
@@ -976,7 +996,7 @@ fn run_agent(
             AgentOutput::Live,
         ) => codex::run_live(request, progress),
         (AgentModel::Pi, AgentOutput::Final) => {
-            pi::run(task, cwd, context, access, user).map(Into::into)
+            pi::run(task, cwd, context, backend_model, access, user)
         }
         (AgentModel::Fx, AgentOutput::Final) => fx::run(request),
         (AgentModel::Jsc, AgentOutput::Final) => jsc::run(task, cwd, access, user).map(Into::into),
@@ -988,6 +1008,7 @@ fn run_agent(
 
 fn interactive_agent(
     model: AgentModel,
+    pi_model: Option<&str>,
     cwd: &Path,
     access: AgentAccess,
     effort: ReasoningEffort,
@@ -1002,12 +1023,48 @@ fn interactive_agent(
         AgentModel::Codex | AgentModel::Sol | AgentModel::Luna | AgentModel::Terra => {
             codex::interactive(cwd, model.backend_model(), access, effort)
         }
-        AgentModel::Pi if effort == ReasoningEffort::Default => pi::interactive(cwd, access),
+        AgentModel::Pi if effort == ReasoningEffort::Default => {
+            pi::interactive(cwd, pi_model, access)
+        }
         AgentModel::Fx if effort == ReasoningEffort::Default => fx::interactive(cwd, access),
         AgentModel::Jsc if effort == ReasoningEffort::Default => jsc::interactive(cwd, access),
         AgentModel::Pi | AgentModel::Fx | AgentModel::Jsc => Err(
             "extra reasoning effort is available only for Claude Code and Codex agents".to_owned(),
         ),
+    }
+}
+
+/// Asks which Pi model to use when `pi?` runs before any `pi.<model>?`.
+fn choose_pi_model(session: &mut Session) -> bool {
+    let models = pi::models();
+    if models.is_empty() {
+        eprintln!("lynn: pi --list-models listed no models");
+        session.last_status = 1;
+        return false;
+    }
+    println!("Choose a Pi model for this session:");
+    for (number, model) in models.iter().enumerate() {
+        println!("  {:>2}  {model}", number + 1);
+    }
+    print!("Model number or name (Enter cancels): ");
+    let _ = io::stdout().flush();
+    let mut answer = String::new();
+    let _ = io::stdin().lock().read_line(&mut answer);
+    let answer = answer.trim();
+    let chosen = match answer.parse::<usize>() {
+        Ok(number) => models.get(number.wrapping_sub(1)).cloned(),
+        Err(_) => (!answer.is_empty()).then(|| answer.to_owned()),
+    };
+    match chosen {
+        Some(model) => {
+            session.pi_model = Some(model);
+            true
+        }
+        None => {
+            eprintln!("lynn: no Pi model chosen");
+            session.last_status = 1;
+            false
+        }
     }
 }
 
@@ -1027,7 +1084,13 @@ fn start_interactive_agent(
         access.description()
     );
     let _ = io::stdout().flush();
-    let status = match interactive_agent(model, &session.cwd, access, effort) {
+    let status = match interactive_agent(
+        model,
+        session.pi_model.as_deref(),
+        &session.cwd,
+        access,
+        effort,
+    ) {
         Ok(command) => agent_cli::run_interactive(command, model.name()),
         Err(error) => {
             eprintln!("lynn: {error}");
@@ -1092,7 +1155,10 @@ fn resolve_inline(
                         task,
                         cwd: &session.cwd,
                         context: &context,
-                        model: agent_model.backend_model(),
+                        model: match agent_model {
+                            AgentModel::Pi => session.pi_model.as_deref(),
+                            _ => agent_model.backend_model(),
+                        },
                         access: AgentAccess::ReadOnly,
                         user: AgentUser::Current,
                         effort: ReasoningEffort::Default,
@@ -1138,6 +1204,11 @@ fn start_agents(request: AgentTask<'_>, session: &mut Session, workers: &mut Wor
         session.last_status = 1;
         return;
     }
+    if models.contains(&AgentModel::Pi) && session.pi_model.is_none() {
+        eprintln!("lynn: {}", pi::choose_model_error());
+        session.last_status = 1;
+        return;
+    }
     if options.effort != ReasoningEffort::Default
         && models.iter().any(|model| {
             matches!(
@@ -1172,6 +1243,12 @@ fn start_agents(request: AgentTask<'_>, session: &mut Session, workers: &mut Wor
         if options.effort != ReasoningEffort::Default {
             session.agent_efforts.insert(id, options.effort);
         }
+        let backend_model = (model == AgentModel::Pi)
+            .then(|| session.pi_model.clone())
+            .flatten();
+        if let Some(pi_model) = &backend_model {
+            session.pi_models.insert(id, pi_model.clone());
+        }
         if options.output == AgentOutput::Live {
             session.streaming_agents.insert(id);
         }
@@ -1181,6 +1258,7 @@ fn start_agents(request: AgentTask<'_>, session: &mut Session, workers: &mut Wor
             task: task.to_owned(),
             cwd: session.cwd.clone(),
             options,
+            backend_model,
         };
         let label = request.label().to_string();
         let predecessor = mutating_predecessor(&request, workers);
@@ -1277,6 +1355,7 @@ fn launch_agent(
         task,
         cwd,
         options,
+        backend_model,
     } = request;
     let references = references.text;
     let tx = workers.worker_tx.clone();
@@ -1295,7 +1374,7 @@ fn launch_agent(
                 task: &task,
                 cwd: &cwd,
                 context: &context,
-                model: model.backend_model(),
+                model: backend_model.as_deref().or(model.backend_model()),
                 access: options.access,
                 user: options.user,
                 effort: options.effort,
@@ -1656,6 +1735,7 @@ fn print_help() {
         "  🍎 task             Alias for fm? task",
         "  fm! task            Ask Apple Foundation Models to change files (background)",
         "  name! task          Ask a named agent to change files as your user",
+        "  pi.model? task      Choose Pi's model (Tab after pi lists them); pi? reuses it",
         "  opus?! task         Ask Opus to change files and show live progress",
         "  luna?! task         Ask Luna to change files and show live progress",
         "  opus?? task         Ask Opus with xhigh reasoning (read-only)",
@@ -1879,6 +1959,11 @@ fn reply_yes(
         return;
     };
     let task = format!("yes #{id}");
+    // Reply with the Pi model that answered, then restore the session's latest choice.
+    let latest_pi_model = match session.pi_models.get(&id) {
+        Some(pi_model) => session.pi_model.replace(pi_model.clone()),
+        None => session.pi_model.clone(),
+    };
     start_agents(
         AgentTask {
             task: &task,
@@ -1888,6 +1973,7 @@ fn reply_yes(
         session,
         workers,
     );
+    session.pi_model = latest_pi_model;
 }
 
 fn latest_agent_response(session: &Session) -> Option<(AgentLabel<'_>, &str)> {
