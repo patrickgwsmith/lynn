@@ -8,7 +8,7 @@ use std::time::Instant;
 pub struct Session {
     pub cwd: PathBuf,
     pub events: Vec<Event>,
-    pub todos: Vec<String>,
+    pub todos: Vec<Todo>,
     pub last_status: i32,
     pub live_commands: Vec<LiveCommand>,
     pub mode: PromptMode,
@@ -92,6 +92,12 @@ pub struct AgentTask<'a> {
     pub options: AgentOptions,
 }
 
+#[derive(Clone)]
+pub struct Todo {
+    pub text: String,
+    pub done: bool,
+}
+
 impl ReasoningEffort {
     pub fn level(self) -> Option<&'static str> {
         match self {
@@ -140,6 +146,8 @@ pub enum AgentModel {
     Terra,
     Pi,
     Fx,
+    Agy,
+    Flash,
     Jsc,
 }
 
@@ -158,6 +166,8 @@ impl AgentModel {
             "terra" => Some(Self::Terra),
             "pi" => Some(Self::Pi),
             "fx" => Some(Self::Fx),
+            "agy" | "antigravity" => Some(Self::Agy),
+            "flash" => Some(Self::Flash),
             "jsc" if cfg!(target_os = "macos") => Some(Self::Jsc),
             _ => None,
         }
@@ -177,18 +187,23 @@ impl AgentModel {
             Self::Terra => "terra",
             Self::Pi => "pi",
             Self::Fx => "fx",
+            Self::Agy => "agy",
+            Self::Flash => "flash",
             Self::Jsc => "jsc",
         }
     }
 
-    /// The model name passed to Claude Code or Codex; `None` uses the CLI default.
+    /// The model name passed to Claude Code, Codex or agy; `None` uses the CLI default.
     pub fn backend_model(self) -> Option<&'static str> {
         match self {
             Self::Fable | Self::Opus | Self::Sonnet | Self::Haiku => Some(self.name()),
             Self::Sol => Some("gpt-6-sol"),
             Self::Luna => Some("gpt-6-luna"),
             Self::Terra => Some("gpt-5.6-terra"),
-            Self::Fm | Self::Claude | Self::Codex | Self::Pi | Self::Fx | Self::Jsc => None,
+            Self::Flash => Some("gemini-3.8-flash-high"),
+            Self::Fm | Self::Claude | Self::Codex | Self::Pi | Self::Fx | Self::Agy | Self::Jsc => {
+                None
+            }
         }
     }
 
@@ -290,6 +305,7 @@ pub enum Input<'a> {
     Comment(&'a str),
     ShowTodos,
     Todo(&'a str),
+    CompleteTodo(&'a str),
     LiveHostShell {
         program: &'static str,
         command: &'a str,
@@ -392,6 +408,11 @@ pub fn classify(line: &str) -> Input<'_> {
         Input::LiveFeed(url.trim_end(), FeedSelection::ContentType)
     } else if line.trim_end() == "-" {
         Input::ShowTodos
+    } else if let Some(rest) = line
+        .strip_prefix("- [x] ")
+        .or_else(|| line.strip_prefix("- [X] "))
+    {
+        Input::CompleteTodo(rest)
     } else if let Some(rest) = line.strip_prefix("- [ ] ") {
         Input::Todo(rest)
     } else if let Some(command) = line
@@ -1039,8 +1060,8 @@ mod tests {
     }
 
     #[test]
-    fn codex_pi_and_fx_questions_are_agent_requests() {
-        for name in ["codex", "pi", "fx"] {
+    fn codex_pi_fx_and_agy_questions_are_agent_requests() {
+        for name in ["codex", "pi", "fx", "agy"] {
             let model = AgentModel::parse(name).unwrap();
             assert_eq!(
                 request(&format!("{name}? inspect this")),
@@ -1074,6 +1095,23 @@ mod tests {
                 expected("fix this", &[model], read_write())
             );
         }
+    }
+
+    #[test]
+    fn flash_is_an_agy_model_alias() {
+        assert_eq!(
+            request("flash? inspect this"),
+            expected("inspect this", &[AgentModel::Flash], read_only())
+        );
+        assert_eq!(
+            request("flash! fix this"),
+            expected("fix this", &[AgentModel::Flash], read_write())
+        );
+        assert_eq!(
+            AgentModel::Flash.backend_model(),
+            Some("gemini-3.8-flash-high")
+        );
+        assert_eq!(AgentModel::Agy.backend_model(), None);
     }
 
     #[test]

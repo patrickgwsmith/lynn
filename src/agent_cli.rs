@@ -8,6 +8,9 @@ use crate::session::{AgentAccess, ReasoningEffort};
 pub const READ_ONLY_REPLY_INSTRUCTION: &str =
     "Answer in one concise plain-text line, preferably under 40 words. Give the finding directly; omit headings, Markdown, preambles, and extra explanation. If the user explicitly requests a longer or structured answer, follow that request.";
 
+pub const MESSAGE_CITATION_INSTRUCTION: &str =
+    "When a numbered message in the Lynn session context materially informs your answer, cite its message number inline as #n. Cite only message numbers shown in the context, and do not add citations when none are relevant.";
+
 pub fn request_for_access(task: &str, access: AgentAccess) -> String {
     match access {
         AgentAccess::ReadOnly => format!("{task}\n\n{READ_ONLY_REPLY_INSTRUCTION}"),
@@ -25,6 +28,7 @@ const READ_ONLY_HOME_WRITABLE: &[(&str, bool)] = &[
     (".codex", false),
     (".pi", false),
     (".fx", false),
+    (".gemini", false),
     (".cache", false),
     ("Library/Caches", false),
 ];
@@ -221,7 +225,9 @@ pub fn run_interactive(mut command: Command, program: &str) -> i32 {
 }
 
 pub fn session_input(context: &str, task: &str) -> String {
-    format!("Lynn session context:\n{context}\nUser request:\n{task}\n")
+    format!(
+        "Lynn session context:\n{context}\n\n{MESSAGE_CITATION_INSTRUCTION}\n\nUser request:\n{task}\n"
+    )
 }
 
 pub fn run(
@@ -238,7 +244,17 @@ pub fn run(
     let output = run_with_input(command, program, session_input(context, task))?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("{program} {}: {}", output.status, stderr.trim()));
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let detail = if stderr.trim().is_empty() {
+            stdout.trim()
+        } else {
+            stderr.trim()
+        };
+        return if detail.is_empty() {
+            Err(format!("{program} {}", output.status))
+        } else {
+            Err(format!("{program} {}: {detail}", output.status))
+        };
     }
     let answer = String::from_utf8_lossy(&output.stdout).trim().to_owned();
     if answer.is_empty() {

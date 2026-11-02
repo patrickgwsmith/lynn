@@ -1,4 +1,5 @@
 mod agent_cli;
+mod agy;
 mod claude;
 mod codex;
 mod feed;
@@ -277,6 +278,7 @@ fn pending_agent_statuses(session: &Session, workers: &Workers, color: bool) -> 
         }
         statuses.push(status.clone());
     }
+    statuses.extend(workers.pending_http.values().cloned());
     statuses
 }
 
@@ -339,6 +341,7 @@ enum HttpRequestKind {
 
 struct HttpUpdate {
     id: usize,
+    kind: HttpRequestKind,
     result: Result<HttpResult, String>,
 }
 
@@ -370,6 +373,9 @@ struct Workers {
     running_writer: Option<usize>,
     write_gate: Arc<Mutex<()>>,
     pending_agents: BTreeMap<usize, String>,
+    pending_http: BTreeMap<usize, String>,
+    /// In-flight GET requests by URL, so agent requests can wait for them.
+    loading_urls: BTreeMap<String, usize>,
     queued_agents: BTreeMap<usize, QueuedAgent>,
     interactive: bool,
     next_http_id: usize,
@@ -429,6 +435,8 @@ impl Workers {
             running_writer: None,
             write_gate: Arc::new(Mutex::new(())),
             pending_agents: BTreeMap::new(),
+            pending_http: BTreeMap::new(),
+            loading_urls: BTreeMap::new(),
             queued_agents: BTreeMap::new(),
             interactive,
             next_http_id: 1,
@@ -486,11 +494,13 @@ fn main() {
             let short_prompt = prompt(session.mode, &session.cwd, false, color);
             let full_prompt = prompt(session.mode, &session.cwd, true, color);
             let statuses = pending_agent_statuses(&session, &workers, color);
+            let todos = session.todos.clone();
             let line = match terminal.read_line(
                 &short_prompt,
                 &full_prompt,
                 session.detail,
                 color,
+                &todos,
                 statuses,
                 workers.wake_reader.as_raw_fd(),
                 || {
@@ -901,14 +911,35 @@ fn handle(
                 println!("no todos");
             } else {
                 for todo in &session.todos {
-                    println!("- [ ] {todo}");
+                    println!("- [{}] {}", if todo.done { 'x' } else { ' ' }, todo.text);
                 }
             }
             session.last_status = 0;
         }
         Input::Todo(todo) => {
-            session.todos.push(todo.into());
-            println!("todo {}: {}", session.todos.len(), todo);
+            session.todos.push(session::Todo {
+                text: todo.into(),
+                done: false,
+            });
+            println!("- [ ] {todo}");
+            session.last_status = 0;
+        }
+        Input::CompleteTodo(text) => {
+            if let Some(todo) = session
+                .todos
+                .iter_mut()
+                .find(|todo| todo.text == text && !todo.done)
+            {
+                todo.done = true;
+                println!("- [x] {}", todo.text);
+                session.last_status = 0;
+            } else if session.todos.iter().any(|todo| todo.text == text) {
+                println!("- [x] {text} (already complete)");
+                session.last_status = 0;
+            } else {
+                eprintln!("lynn: no matching todo: {text}");
+                session.last_status = 1;
+            }
         }
         Input::LiveHostShell { program, command } => {
             start_live_command(program, command, session, workers)
@@ -999,10 +1030,17 @@ fn run_agent(
             pi::run(task, cwd, context, backend_model, access, user)
         }
         (AgentModel::Fx, AgentOutput::Final) => fx::run(request),
+        (AgentModel::Agy | AgentModel::Flash, AgentOutput::Final) => agy::run(request),
         (AgentModel::Jsc, AgentOutput::Final) => jsc::run(task, cwd, access, user).map(Into::into),
-        (AgentModel::Fm | AgentModel::Pi | AgentModel::Fx | AgentModel::Jsc, AgentOutput::Live) => {
-            Err("live status is unavailable for this agent".to_owned())
-        }
+        (
+            AgentModel::Fm
+            | AgentModel::Pi
+            | AgentModel::Fx
+            | AgentModel::Agy
+            | AgentModel::Flash
+            | AgentModel::Jsc,
+            AgentOutput::Live,
+        ) => Err("live status is unavailable for this agent".to_owned()),
     }
 }
 
@@ -1023,13 +1061,16 @@ fn interactive_agent(
         AgentModel::Codex | AgentModel::Sol | AgentModel::Luna | AgentModel::Terra => {
             codex::interactive(cwd, model.backend_model(), access, effort)
         }
+        AgentModel::Agy | AgentModel::Flash => {
+            agy::interactive(cwd, model.backend_model(), access, effort)
+        }
         AgentModel::Pi if effort == ReasoningEffort::Default => {
             pi::interactive(cwd, pi_model, access)
         }
         AgentModel::Fx if effort == ReasoningEffort::Default => fx::interactive(cwd, access),
         AgentModel::Jsc if effort == ReasoningEffort::Default => jsc::interactive(cwd, access),
         AgentModel::Pi | AgentModel::Fx | AgentModel::Jsc => Err(
-            "extra reasoning effort is available only for Claude Code and Codex agents".to_owned(),
+            "extra reasoning effort is available only for Claude Code, Codex, and agy".to_owned(),
         ),
     }
 }
@@ -1217,11 +1258,15 @@ fn start_agents(request: AgentTask<'_>, session: &mut Session, workers: &mut Wor
             )
         })
     {
-        eprintln!(
-            "lynn: extra reasoning effort is available only for Claude Code and Codex agents"
-        );
+        eprintln!("lynn: extra reasoning effort is available only for Claude Code, Codex, and agy");
         session.last_status = 1;
         return;
+    }
+    // Load each URL once; later requests reuse the stored or in-flight GET.
+    for url in task_urls(task) {
+        if stored_resource_id(session, url).is_none() && !workers.loading_urls.contains_key(url) {
+            start_http(url, HttpRequestKind::Load, session, workers);
+        }
     }
     let references = match resolve_references(task, session, workers) {
         Ok(references) => references,
@@ -1650,6 +1695,7 @@ fn start_http(url: &str, kind: HttpRequestKind, session: &mut Session, workers: 
                 if updates
                     .send(WorkerUpdate::Http(HttpUpdate {
                         id: request.id,
+                        kind: request.kind,
                         result,
                     }))
                     .is_err()
@@ -1672,9 +1718,19 @@ fn start_http(url: &str, kind: HttpRequestKind, session: &mut Session, workers: 
         session.last_status = 1;
     } else {
         workers.active_http += 1;
+        if let HttpRequestKind::Load = kind {
+            workers.loading_urls.insert(url.to_owned(), id);
+        }
         session.last_status = 0;
-        if matches!(kind, HttpRequestKind::Load) {
-            println!("[url #{id} loading] {url}");
+        let label = match kind {
+            HttpRequestKind::Load => "GET",
+            HttpRequestKind::Head => "HEAD",
+        };
+        let status = format!("{label}#{id} {url}: …");
+        if workers.interactive {
+            workers.pending_http.insert(id, status);
+        } else {
+            println!("{status}");
         }
     }
 }
@@ -1713,6 +1769,7 @@ fn print_help() {
         "  # comment           Keep context for later agent requests",
         "  -                   Show the session todo list",
         "  - [ ] todo          Add a session todo",
+        "  - [x] todo          Mark a matching todo complete",
         "Agent:",
         "  claude? task        Ask Claude Code to inspect the project (background)",
         "  fable? task         Ask Claude Code with Fable (background)",
@@ -1730,6 +1787,8 @@ fn print_help() {
         "  pi? task            Ask Pi to inspect the project (background)",
         "  fx? task            Ask fx to inspect the project (macOS, background)",
         "  fx! task            Ask fx to change files (background)",
+        "  agy? task           Ask Antigravity to inspect the project (background)",
+        "  flash? task         Ask Gemini Flash through Antigravity (background)",
         "  🥧 task             Alias for pi? task",
         "  fm? task            Ask Apple Foundation Models to investigate (background)",
         "  🍎 task             Alias for fm? task",
@@ -1752,6 +1811,7 @@ fn print_help() {
         "  yes!, yes! #3       Reply yes and let the agent change files",
         "  Down at empty prompt  Expand prompt, replies, and model details",
         "  claude? agree? #3   Include a numbered result; queue if an agent is still working",
+        "  opus? https://...   GET the URL once, then include the full page",
     ] {
         println!("{}", terminal::styled_input(line, color));
     }
@@ -1881,7 +1941,11 @@ fn session_context_filtered(
         }
     }
     for todo in &session.todos {
-        context.push_str(&format!("todo: {todo}\n"));
+        context.push_str(&format!(
+            "todo: - [{}] {}\n",
+            if todo.done { 'x' } else { ' ' },
+            todo.text
+        ));
     }
     context
 }
@@ -2018,6 +2082,24 @@ fn http_response_by_id(session: &Session, id: usize) -> Option<String> {
     })
 }
 
+/// The http:// and https:// URLs in an agent task, without trailing punctuation.
+fn task_urls(task: &str) -> impl Iterator<Item = &str> {
+    task.split_whitespace().filter_map(|word| {
+        let start = word.find("https://").or_else(|| word.find("http://"))?;
+        let url = word[start..]
+            .trim_end_matches(['.', ',', ';', ':', '!', '?', ')', ']', '>', '"', '\'']);
+        url.contains("://").then_some(url)
+    })
+}
+
+/// The latest stored GET result for this URL.
+fn stored_resource_id(session: &Session, url: &str) -> Option<usize> {
+    session.events.iter().rev().find_map(|event| match event {
+        Event::Resource { id, resource } if resource.url == url => Some(*id),
+        _ => None,
+    })
+}
+
 fn watch_response_by_id(session: &Session, id: usize, revision: Option<usize>) -> Option<String> {
     let watch = session.live_commands.iter().find(|watch| watch.id == id)?;
     let revision = revision.unwrap_or(watch.revisions.len());
@@ -2077,6 +2159,12 @@ fn ready_references(
             let id = ids[0];
             if let Some(label) = agent_label_by_id(session, id) {
                 Err(format!("{label} is still working"))
+            } else if let Some(url) = workers
+                .loading_urls
+                .iter()
+                .find_map(|(url, loading)| (*loading == id).then_some(url))
+            {
+                Err(format!("GET#{id} {url} is still loading"))
             } else {
                 Err(format!("watch #{id} is still loading"))
             }
@@ -2143,6 +2231,24 @@ fn resolve_references(
     let mut seen = BTreeSet::new();
     let mut seen_watch_revisions = BTreeSet::new();
     let mut pending = BTreeSet::new();
+    // A URL in the task stands for its stored GET result, so the full page is
+    // included rather than the excerpt in the session context.
+    for url in task_urls(task) {
+        if let Some(id) = stored_resource_id(session, url) {
+            if seen.insert(id) {
+                let text = http_response_by_id(session, id).unwrap();
+                context.push_str(&format!("\nReferenced HTTP result #{id}:\n{text}\n"));
+            }
+        } else if let Some(&id) = workers.loading_urls.get(url) {
+            pending.insert(id);
+        }
+    }
+    // Skip URL words so fragments and paths are not read as references.
+    let task = task
+        .split_whitespace()
+        .filter(|word| !word.contains("://"))
+        .collect::<Vec<_>>()
+        .join(" ");
     for raw_token in task.split(|character: char| {
         !(character.is_ascii_alphanumeric()
             || character == '#'
@@ -2335,15 +2441,17 @@ fn format_worker_update(
         }
         WorkerUpdate::Http(update) => {
             workers.active_http = workers.active_http.saturating_sub(1);
-            match update.result {
+            workers.loading_urls.retain(|_, id| *id != update.id);
+            let line = match update.result {
                 Ok(HttpResult::Resource(resource)) => {
                     let message = format!(
-                        "[url #{}] loaded {} bytes from {} ({})",
+                        "GET#{} {} ({} {} bytes): …",
                         update.id,
-                        resource.content.len(),
                         resource.url,
-                        resource.content_type
+                        resource.content_type,
+                        resource.content.len()
                     );
+                    workers.pending_http.remove(&update.id);
                     session.events.push(Event::Resource {
                         id: update.id,
                         resource,
@@ -2351,7 +2459,9 @@ fn format_worker_update(
                     Some(message)
                 }
                 Ok(HttpResult::Head { url, output }) => {
-                    let message = format!("[head #{}] {url}\n{output}", update.id);
+                    let status = output.lines().next().unwrap_or("HTTP response");
+                    let message = format!("HEAD#{} {url} ({status}): …", update.id);
+                    workers.pending_http.remove(&update.id);
                     session.events.push(Event::HttpHead {
                         id: update.id,
                         url,
@@ -2360,10 +2470,17 @@ fn format_worker_update(
                     Some(message)
                 }
                 Err(error) => {
+                    workers.pending_http.remove(&update.id);
                     session.last_status = 1;
-                    Some(format!("[url #{} error] {error}", update.id))
+                    let label = match update.kind {
+                        HttpRequestKind::Load => "GET",
+                        HttpRequestKind::Head => "HEAD",
+                    };
+                    Some(format!("{label}#{} error: {error}", update.id))
                 }
-            }
+            };
+            resume_queued_agents(session, workers);
+            line
         }
     }
 }
@@ -2489,7 +2606,10 @@ mod tests {
         session
             .events
             .push(Event::Comment("Latest instruction".into()));
-        session.todos.push("Validate cancellation".into());
+        session.todos.push(crate::session::Todo {
+            text: "Validate cancellation".into(),
+            done: false,
+        });
         let context = session_context(&session);
         assert!(context.starts_with(&format!("cwd: {}\n", session.cwd.display())));
         assert!(context.contains("comment: Always preserve the existing CLI syntax\n"));
@@ -2499,7 +2619,9 @@ mod tests {
         assert!(context.contains(&format!("response (opus!#1): {reply}\n")));
         assert!(context.contains("command: command-0 (exit 0)\n"));
         assert!(context.contains("command: command-99 (exit 0)\n"));
-        assert!(context.ends_with("comment: Latest instruction\ntodo: Validate cancellation\n"));
+        assert!(
+            context.ends_with("comment: Latest instruction\ntodo: - [ ] Validate cancellation\n")
+        );
         assert!(
             context.find("Always preserve").unwrap() < context.find("Earlier findings").unwrap()
         );
@@ -2535,6 +2657,38 @@ mod tests {
             super::session_context_filtered(&session, &references.ids, None, &session.cwd);
         assert!(!automatic.contains("resource:"));
         assert!(automatic.contains("comment: Preserve this instruction\n"));
+    }
+
+    #[test]
+    fn task_urls_wait_for_loading_gets_and_reuse_stored_results() {
+        let mut session = Session::new().unwrap();
+        let mut workers = Workers::new(false);
+        let url = "https://example.com/post";
+        let task = format!("compare ({url}). with lynn");
+        assert_eq!(super::task_urls(&task).collect::<Vec<_>>(), [url]);
+        workers.loading_urls.insert(url.into(), 2);
+        assert!(matches!(
+            resolve_references(&task, &session, &workers).unwrap(),
+            ReferenceResolution::Pending(ids) if ids == [2]
+        ));
+        workers.loading_urls.clear();
+        session.events.push(Event::Resource {
+            id: 2,
+            resource: crate::session::Resource {
+                url: url.into(),
+                content_type: "text/plain".into(),
+                content: format!("{}TAIL_OF_PAGE", "β".repeat(9_000)),
+            },
+        });
+        let references = ready_references(&task, &session, &workers).unwrap();
+        assert!(references.ids.contains(&2));
+        assert!(references.text.contains("Referenced HTTP result #2"));
+        assert!(references.text.contains("TAIL_OF_PAGE"));
+        assert_eq!(super::stored_resource_id(&session, url), Some(2));
+        // A fragment in a URL is not a reference, and unknown URLs are left to the agent.
+        let references =
+            ready_references("read https://example.com/#3 too", &session, &workers).unwrap();
+        assert!(references.ids.is_empty());
     }
 
     #[test]
@@ -3012,7 +3166,10 @@ mod tests {
     fn reset_restarts_counters_and_discards_old_worker_updates() {
         let mut session = Session::new().unwrap();
         session.events.push(Event::Comment("old context".into()));
-        session.todos.push("old todo".into());
+        session.todos.push(crate::session::Todo {
+            text: "old todo".into(),
+            done: false,
+        });
         session.mode = PromptMode::FmReadOnly;
         session.last_status = 7;
         let mut workers = Workers::new(false);

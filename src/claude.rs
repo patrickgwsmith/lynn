@@ -24,7 +24,11 @@ pub fn run(request: Request<'_>) -> Result<AgentReply, String> {
         agent_cli::run_with_input(command, "claude", agent_cli::session_input(context, &task))?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("claude {}: {}", output.status, stderr.trim()));
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let result = serde_json::from_str::<serde_json::Value>(&stdout)
+            .ok()
+            .and_then(|value| value["result"].as_str().map(str::to_owned));
+        return Err(cli_error(output.status, &stderr, result.as_deref()));
     }
     parse_result(&output.stdout)
 }
@@ -187,12 +191,31 @@ pub fn run_live(
         .map_err(|_| "claude stderr reader panicked")?
         .map_err(|error| format!("claude stderr: {error}"))?;
     if !status.success() {
-        return Err(format!("claude {status}: {}", stderr.trim()));
+        let result = answer
+            .as_ref()
+            .and_then(|result| result.as_ref().err())
+            .map(String::as_str)
+            .or(stream_error.as_deref());
+        return Err(cli_error(status, &stderr, result));
     }
     if let Some(error) = stream_error {
         return Err(error);
     }
     answer.ok_or_else(|| "claude returned no result".to_owned())?
+}
+
+fn cli_error(status: std::process::ExitStatus, stderr: &str, result: Option<&str>) -> String {
+    let detail = result
+        .map(str::trim)
+        .filter(|detail| !detail.is_empty())
+        .or_else(|| {
+            let stderr = stderr.trim();
+            (!stderr.is_empty()).then_some(stderr)
+        });
+    match detail {
+        Some(detail) => format!("claude {status}: {detail}"),
+        None => format!("claude {status}"),
+    }
 }
 
 fn progress_from_event(event: &serde_json::Value) -> Option<String> {

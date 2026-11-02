@@ -1,17 +1,15 @@
 # Lynn
 
-Lynn is an experimental shell for humans and coding agents. You type shell commands and agent requests at the same prompt.
-
-Lynn brings a shell and coding agents into one session. The shell runs your commands and agents handle coding requests using shared session context.
+Lynn combines a shell with coding agents in one shared session. Run `git status` and other commands directly, without spending model tokens. Agent requests run in the background like processes, so you can keep working while they respond. Pass findings between agents and models by referencing numbered replies such as `#25`. Agent requests use `?` for read-only access; `!` gives an agent write access when you choose.
 
 Lynn is named in honour of biologist Lynn Margulis, whose work on endosymbiosis helped explain how the mitochondria in our own cells, and the chloroplasts in plants and algae, originated from bacteria that came to live within other cells.
 
 ## Install
 
-With Rust and Cargo installed, install from this checkout and start Lynn:
+With Rust and Cargo installed, install Lynn from crates.io and start it:
 
 ```sh
-cargo install --path .
+cargo install lynn
 lynn
 ```
 
@@ -36,7 +34,7 @@ Lynn does not give full protection. Read [Limits of the protection](#limits-of-t
 
 - macOS or Linux.
 - Rust and Cargo, to install or build Lynn.
-- One or more agent CLIs, installed and authenticated: Claude Code, Codex, Pi, or fx.
+- One or more agent CLIs, installed and authenticated: Claude Code, Codex, Pi, fx, or the Antigravity CLI (`agy`).
 - Optional, on macOS: Apple's `fm` CLI, with its license accepted.
 
 ## Build and run
@@ -64,6 +62,7 @@ Lynn supports these agent names:
 | `codex`, `sol`, `luna`, `terra` | Codex |
 | `pi` | Pi |
 | `fx` | fx (`fx?` requires macOS) |
+| `agy`, `antigravity`, `flash` | Antigravity CLI |
 | `fm` | Apple Foundation Models (macOS only) |
 | `jsc` | JavaScriptCore shell (macOS only) |
 
@@ -88,7 +87,7 @@ pi! rename parse_line to parse_input
 
 Type `pi` and press Tab to list Pi's models; Lynn runs `pi --list-models` each time. `pi.<model>?` and `pi.<model>!` use that model and remember it, so later `pi?`, `pi!`, `🥧`, and `opus/pi?` requests use it too. If you enter `pi?` or `pi!` before choosing a model, Lynn lists Pi's models and asks you to enter a number or a model name; press Enter to cancel. When input is not a terminal, Lynn reports an error instead. Lynn never falls back to Pi's own default model. Use `provider/model` when two providers have a model with the same name, for example `pi.kapitsa/qwen3.5-9b?`. `yes #n` reuses the model that wrote #n. Expanded replies show the model as `[requested kapitsa/qwen3.5-9b; actual model unreported]`. `@staffer pi?` runs Pi as staffer, which uses staffer's own Pi configuration.
 
-Repeat the final `?` or `!` to request more reasoning from Claude Code or Codex agents. `opus?? task` and `sol!! task` request `xhigh`; `opus??? task` and `sol!!! task` request `max`. `?` remains read-only and `!` retains write access. A single suffix uses the agent's normal effort setting. This also works with a read-only group, such as `opus/luna?? task`, or with a bare interactive selector such as `opus??`. Lynn shows the requested suffix in each result label, for example `opus??#3`. The selected model or your provider settings may limit the actual effort; if the provider rejects the requested level, Lynn reports its error.
+Repeat the final `?` or `!` to request more reasoning from Claude Code, Codex, or agy. `opus?? task` and `sol!! task` request `xhigh`; `opus??? task` and `sol!!! task` request `max`. `?` remains read-only and `!` retains write access. A single suffix uses the agent's normal effort setting. This also works with a read-only group, such as `opus/luna?? task`, or with a bare interactive selector such as `opus??`. Lynn shows the requested suffix in each result label, for example `opus??#3`. The selected model or your provider settings may limit the actual effort; if the provider rejects the requested level, Lynn reports its error.
 
 Use `opus?! task` or `luna?! task` to give an agent write access and show live progress while it works. Lynn updates the pending line from Claude Code's or Codex's streamed events, then records the complete final answer as `opus?!#n` or `luna?!#n`. This works with all Claude Code and Codex model names. The stream is shown only in the terminal; the shared session stores the final answer.
 
@@ -106,8 +105,9 @@ For a `?` request, Lynn uses these restrictions:
 - **Claude Code:** Lynn uses restricted mode and an explicit list of tools.
 - **fx:** `fx?` uses the macOS system sandbox to enforce read-only access; fx has no native read-only mode, so `fx?` is unavailable on Linux. `fx!` uses `fx ask --auto`, allowing edits subject to fx's automatic permission review. Background requests use `--no-save` and share Lynn's session context.
 - **Pi:** Lynn uses an explicit list of tools.
+- **agy:** Lynn uses Antigravity's `plan` mode. Headless runs deny any action that would need approval. `agy!` uses `--mode auto`, which allows edits and safe commands and denies actions that Antigravity would ask you about. Lynn passes the session context as the prompt argument, so a very large context can exceed the operating system's argument limit.
 - **fm:** Lynn controls the tools. The agent can list directories and read files in the current directory. It cannot write files or run commands.
-- **macOS system sandbox:** For Claude Code, Codex, Pi, fx, and jsc, a macOS sandbox denies all file writes except to `/dev`, the temporary directories (`/tmp` and `/var/folders`), and the agent user's `~/.claude`, `~/.claude.json*`, `~/.codex`, `~/.pi`, `~/.fx`, `~/.cache`, and `~/Library/Caches`. This protects your project, its Git index, other repositories, and the rest of your home directory.
+- **macOS system sandbox:** For Claude Code, Codex, Pi, fx, agy, and jsc, a macOS sandbox denies all file writes except to `/dev`, the temporary directories (`/tmp` and `/var/folders`), and the agent user's `~/.claude`, `~/.claude.json*`, `~/.codex`, `~/.pi`, `~/.fx`, `~/.gemini`, `~/.cache`, and `~/Library/Caches`. This protects your project, its Git index, other repositories, and the rest of your home directory.
 
 For a `!` request, Codex uses its `workspace-write` sandbox. Other agents can write files and run commands.
 
@@ -148,7 +148,7 @@ Each request gets a label, for example `codex?#3` for read-only access or `opus!
 - Press Down at an empty prompt to show each running or queued request above its status line, and expand existing replies with their original requests and model details. Claude Code reports the model or models used in `modelUsage`, for example `opus?#3 [used claude-opus-5-5]: answer`. Codex does not report the actual model in its result events, so Lynn shows its explicitly requested model as unverified, for example `[requested gpt-6-luna; actual model unreported]`. Compact replies and `#3` recall omit this detail.
 - To show the latest completed agent reply, enter `#`. To show a specific full answer, enter `#3` or `codex?#3`. Older labels such as `codex#3` also work.
 - To answer an agent's question with yes, enter `yes`. Lynn sends `yes #n` to the same agent that wrote the latest reply, with the same access and effort. To reply to a specific answer, enter `yes #3`; if #3 was an `opus?` request, this is the same as `opus? yes #3`. A read-only agent cannot act on a plain `yes`, so to let it go ahead and change files, enter `yes!` or `yes! #3`. To run the `yes` command, enter `bash! yes`.
-- Claude, Codex, Pi, fx, and fm read-only agents are asked for a concise one-line answer, preferably under 40 words, unless you explicitly request more detail or a structured answer. Lynn displays their replies without clipping; long lines wrap on screen.
+- Claude, Codex, Pi, fx, agy, and fm read-only agents are asked for a concise one-line answer, preferably under 40 words, unless you explicitly request more detail or a structured answer. Lynn displays their replies without clipping; long lines wrap on screen.
 - To give an answer to a different agent, refer to it in the request. For example: `claude? do you agree with #3?`
 - If a request refers to an unfinished answer, Lynn queues it in the background, shows `waiting for #3`, and starts it when the answer arrives. A request with several references waits for all of them. Lynn builds the queued request's context after those answers enter the session log and includes each referenced answer once. If a referenced request fails, the queued request reports the failure.
 - Entering `#3` by itself while it is still running reports that it is still in progress.
@@ -209,6 +209,8 @@ For a summary of earlier session results, such as `fm? summarize the ops/s`, Lyn
 For an ordinary command such as `git status`, Lynn shows you the output in the terminal, but gives agents only the command text and exit status. It does not add that command's stdout or stderr to the shared session.
 
 Agent requests receive the full session history of commands, comments, agent requests, and replies, plus current todos. Older instructions are retained until `reset` or exit; Lynn does not drop conversation events by count or truncate the assembled conversation. Watched outputs and web pages use bounded excerpts with visible omission markers. Explicit `#n` references supply stored results without duplicating them in the automatic context. Long sessions therefore produce larger prompts; there is no automatic conversation summarization.
+
+Agents are asked to cite numbered session messages such as `#25` when those messages materially inform an answer. These are the agent's attributions; Lynn does not treat them as a complete or independently verified record of everything that influenced its response.
 
 To share a command's output with agents, register a watch such as `+ bash? git status`. Lynn includes watch output in agent context. Shell watches run as `staffer`, and you refresh them by entering `+` or `+-`. Agents can also run commands themselves when their access allows it, so this controls what Lynn shares automatically rather than what an agent can ever learn.
 
@@ -327,8 +329,8 @@ cargo publish
 Lynn keeps these items in the session, and agents can see them:
 
 - Comments that start with `#`.
-- Todos that start with `- [ ]`.
-- Web pages. Enter an HTTP or HTTPS URL to load the page in the background. Lynn keeps up to 4 MiB of each page in memory. Agents get a part of the page.
+- Todos that start with `- [ ]`. Enter `- [x] ` and press Tab to complete an unfinished todo, then press Enter to check it off. You can also type the exact todo text directly.
+- Web pages. Enter an HTTP or HTTPS URL to load the page in the background. Lynn keeps up to 4 MiB of each page in memory. Agents get a part of the page. To give an agent the whole page, put the URL in the request, as in `opus? summarize https://...`. Lynn loads the page first, or reuses the copy it already has, and then sends the request.
 
 Enter `-` alone to show the current TODO list.
 

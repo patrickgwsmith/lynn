@@ -105,8 +105,11 @@ pub fn run_live(
                             answer = Some(text.to_owned());
                         }
                     }
-                    if event["type"] == "turn.failed" {
-                        turn_error = event["error"]["message"].as_str().map(str::to_owned);
+                    if matches!(event["type"].as_str(), Some("error" | "turn.failed")) {
+                        turn_error = event["error"]["message"]
+                            .as_str()
+                            .or_else(|| event["message"].as_str())
+                            .map(str::to_owned);
                     }
                 }
                 Err(error) => {
@@ -131,7 +134,18 @@ pub fn run_live(
         .map_err(|_| "codex stderr reader panicked")?
         .map_err(|error| format!("codex stderr: {error}"))?;
     if !status.success() {
-        return Err(format!("codex {status}: {}", stderr.trim()));
+        let detail = turn_error
+            .as_deref()
+            .filter(|detail| !detail.trim().is_empty())
+            .or_else(|| {
+                let stderr = stderr.trim();
+                (!stderr.is_empty()).then_some(stderr)
+            })
+            .or_else(|| stream_error.as_deref());
+        return match detail {
+            Some(detail) => Err(format!("codex {status}: {}", detail.trim())),
+            None => Err(format!("codex {status}")),
+        };
     }
     if let Some(error) = stream_error {
         return Err(error);

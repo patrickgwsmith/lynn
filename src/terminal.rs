@@ -114,6 +114,7 @@ impl Terminal {
         full_prompt: &str,
         detail: DisplayDetail,
         color: bool,
+        todos: &[crate::session::Todo],
         mut statuses: Vec<String>,
         wake_fd: RawFd,
         mut notices: impl FnMut() -> (Vec<String>, Vec<String>),
@@ -275,7 +276,7 @@ impl Terminal {
                 }
                 9 => {
                     if let Ok(line) = std::str::from_utf8(&bytes) {
-                        let completion = completions(line, cursor, &self.history);
+                        let completion = completions(line, cursor, &self.history, todos);
                         if !completion.matches.is_empty() {
                             let replacement = if completion.matches.len() == 1 {
                                 completion.matches[0].clone()
@@ -1033,7 +1034,45 @@ fn history_completion(line: &str, cursor: usize, history: &[String]) -> Option<C
     })
 }
 
-fn completions(line: &str, cursor: usize, history: &[String]) -> Completion {
+fn todo_completion(
+    line: &str,
+    cursor: usize,
+    todos: &[crate::session::Todo],
+) -> Option<Completion> {
+    if cursor != line.len() {
+        return None;
+    }
+    let marker = if line.starts_with("- [x]") || line.starts_with("- [X]") {
+        5
+    } else {
+        return None;
+    };
+    let typed = &line[marker..];
+    if !typed.is_empty() && !typed.starts_with(' ') {
+        return None;
+    }
+    let matches: Vec<_> = todos
+        .iter()
+        .filter(|todo| !todo.done)
+        .map(|todo| format!(" {}", todo.text))
+        .filter(|text| text.starts_with(typed))
+        .collect();
+    (!matches.is_empty()).then_some(Completion {
+        start: marker,
+        end: cursor,
+        matches,
+    })
+}
+
+fn completions(
+    line: &str,
+    cursor: usize,
+    history: &[String],
+    todos: &[crate::session::Todo],
+) -> Completion {
+    if let Some(completion) = todo_completion(line, cursor, todos) {
+        return completion;
+    }
     if let Some(completion) = history_completion(line, cursor, history) {
         return completion;
     }
@@ -1051,14 +1090,15 @@ fn completions_in(line: &str, cursor: usize, cwd: &Path) -> Completion {
             &[
                 "claude?", "claude!", "opus?", "opus!", "sonnet?", "sonnet!", "codex?", "codex!",
                 "Opus?", "Opus!", "sol?", "sol!", "luna?", "luna!", "terra?", "terra!", "pi?",
-                "pi!",
+                "pi!", "agy?", "agy!", "flash?", "flash!",
             ]
         } else {
             &[
                 "cd", "exit", "export", "unset", "reset", "bash!", "zsh!", "bash?", "zsh?",
                 "@staffer", "fm?", "fm!", "claude?", "claude!", "opus?", "opus!", "sonnet?",
                 "Opus?", "Opus!", "sonnet!", "codex?", "codex!", "sol?", "sol!", "luna?", "luna!",
-                "terra?", "terra!", "pi?", "pi!", "🎵", "🎶", "☀️", "🌙", "🥧", "🍎",
+                "terra?", "terra!", "pi?", "pi!", "agy?", "agy!", "flash?", "flash!", "🎵", "🎶",
+                "☀️", "🌙", "🥧", "🍎",
             ]
         };
         for built_in in built_ins {
@@ -1076,6 +1116,7 @@ fn completions_in(line: &str, cursor: usize, cwd: &Path) -> Completion {
         }
         for model in [
             "claude", "fable", "opus", "Opus", "sonnet", "haiku", "codex", "sol", "luna", "terra",
+            "agy", "flash",
         ] {
             for suffix in ["??", "???", "!!", "!!!"] {
                 let selector = format!("{model}{suffix}");

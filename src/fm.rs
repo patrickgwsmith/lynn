@@ -173,7 +173,8 @@ fn summary_prompt(task: &str, source: &str, access: AgentAccess) -> String {
         "Keep the answer concise."
     };
     format!(
-        "Answer the request from the supplied Lynn session results. Use relevant figures from earlier replies when present. If the requested facts are absent, say so; do not invent them.\n\nRequest: {task}\n\nLynn session results:\n{source}\n\n{reply_instruction}"
+        "Answer the request from the supplied Lynn session results. Use relevant figures from earlier replies when present. If the requested facts are absent, say so; do not invent them.\n{}\n\nRequest: {task}\n\nLynn session results:\n{source}\n\n{reply_instruction}",
+        agent_cli::MESSAGE_CITATION_INSTRUCTION
     )
 }
 
@@ -211,7 +212,8 @@ fn run_with(
             String::new()
         };
         let prompt = format!(
-            "Task: {task}\nWorkspace: {}\n{access_instruction}\nShared session:\n{context}\nPrior tool results:\n{observations}\n{next_step}\n{reply_instruction}",
+            "Task: {task}\nWorkspace: {}\n{access_instruction}\n{}\nShared session:\n{context}\nPrior tool results:\n{observations}\n{next_step}\n{reply_instruction}",
+            agent_cli::MESSAGE_CITATION_INSTRUCTION,
             root.display()
         );
         let step = respond(mode, &prompt)?;
