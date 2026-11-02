@@ -41,6 +41,8 @@ struct AgentUpdate {
     model: String,
     access: AgentAccess,
     result: Result<AgentReply, String>,
+    /// How long the agent ran, not counting time queued.
+    elapsed: Duration,
 }
 
 struct QueuedAgent {
@@ -155,7 +157,7 @@ impl std::fmt::Display for AgentLabel<'_> {
 }
 
 fn render_agent(label: AgentLabel<'_>, display: AgentDisplay<'_>, styling: Styling) -> String {
-    render_agent_with_models(label, display, styling, None)
+    render_agent_with_models(label, display, styling, None, None)
 }
 
 fn render_agent_with_models(
@@ -163,15 +165,25 @@ fn render_agent_with_models(
     display: AgentDisplay<'_>,
     styling: Styling,
     model_info: Option<&ModelInfo>,
+    elapsed: Option<Duration>,
 ) -> String {
     let color = styling == Styling::Terminal && output_color();
-    let detail = match model_info {
-        Some(ModelInfo::Reported(models)) => format!(" [used {}]", models.join(", ")),
+    let models = match model_info {
+        Some(ModelInfo::Reported(models)) => Some(format!("used {}", models.join(", "))),
         Some(ModelInfo::Requested(model)) => {
-            format!(" [requested {model}; actual model unreported]")
+            Some(format!("requested {model}; actual model unreported"))
         }
-        Some(ModelInfo::Unreported) => " [model unreported]".to_owned(),
-        None => String::new(),
+        Some(ModelInfo::Unreported) => Some("model unreported".to_owned()),
+        None => None,
+    };
+    let parts: Vec<_> = models
+        .into_iter()
+        .chain(elapsed.map(format_elapsed))
+        .collect();
+    let detail = if parts.is_empty() {
+        String::new()
+    } else {
+        format!(" [{}]", parts.join("; "))
     };
     match display {
         AgentDisplay::Working => format!("{label}: …"),
@@ -186,6 +198,17 @@ fn render_agent_with_models(
         }
         AgentDisplay::Error(text) if color => format!("\x1b[1;31m{label}: error:\x1b[0m {text}"),
         AgentDisplay::Error(text) => format!("{label}: error: {text}"),
+    }
+}
+
+/// A response time such as `0.8s`, `12.4s` or `3m 05s`.
+fn format_elapsed(elapsed: Duration) -> String {
+    let seconds = elapsed.as_secs_f64();
+    if seconds < 60.0 {
+        format!("{seconds:.1}s")
+    } else {
+        let whole = elapsed.as_secs();
+        format!("{}m {:02}s", whole / 60, whole % 60)
     }
 }
 
@@ -204,12 +227,15 @@ fn render_session_agent(
     prompt: PromptLine,
 ) -> String {
     let label = label.in_session(session);
-    let detail = if prompt == PromptLine::Always {
-        session.model_details.get(&label.id)
+    let (detail, elapsed) = if prompt == PromptLine::Always {
+        (
+            session.model_details.get(&label.id),
+            session.agent_elapsed.get(&label.id).copied(),
+        )
     } else {
-        None
+        (None, None)
     };
-    let result = render_agent_with_models(label, display, Styling::Terminal, detail);
+    let result = render_agent_with_models(label, display, Styling::Terminal, detail, elapsed);
     if prompt == PromptLine::WhenExpanded && !session.expanded_response_ids.contains(&label.id) {
         return result;
     }
@@ -1190,6 +1216,7 @@ fn resolve_inline(
                     render_agent(label, AgentDisplay::Working, Styling::Plain)
                 );
                 let _ = io::stdout().flush();
+                let started = Instant::now();
                 let answer = run_agent(
                     agent_model,
                     agent_cli::Request {
@@ -1210,6 +1237,7 @@ fn resolve_inline(
                 )
                 .map_err(|error| format!("{label}: {error}"))?;
                 let quoted = inline::quote_argument(&answer.text)?;
+                session.agent_elapsed.insert(id, started.elapsed());
                 if let Some(info) = answer.model_info {
                     session.model_details.insert(id, info);
                 }
@@ -1413,6 +1441,7 @@ fn launch_agent(
             None
         };
         let progress_tx = tx.clone();
+        let started = Instant::now();
         let result = run_agent(
             model,
             agent_cli::Request {
@@ -1435,6 +1464,7 @@ fn launch_agent(
             model: model.name().to_owned(),
             access: options.access,
             result,
+            elapsed: started.elapsed(),
         }));
     });
 }
@@ -2497,6 +2527,7 @@ fn format_update(update: AgentUpdate, session: &mut Session, workers: &mut Worke
             if let Some(info) = reply.model_info {
                 session.model_details.insert(update.id, info);
             }
+            session.agent_elapsed.insert(update.id, update.elapsed);
             let display = match update.access {
                 AgentAccess::ReadOnly => AgentDisplay::Answer(&reply.text),
                 AgentAccess::ReadWrite => AgentDisplay::FullAnswer(&reply.text),
@@ -2550,6 +2581,7 @@ fn resume_queued_agents(session: &Session, workers: &mut Workers) {
             Err(error) => {
                 let request = workers.queued_agents.remove(&id).unwrap();
                 let _ = workers.worker_tx.send(WorkerUpdate::Agent(AgentUpdate {
+                    elapsed: Duration::ZERO,
                     id,
                     model: request.model.name().to_owned(),
                     access: request.options.access,
@@ -2564,10 +2596,10 @@ fn resume_queued_agents(session: &Session, workers: &mut Workers) {
 mod tests {
     use super::{
         agent_context, agent_response, agent_response_by_id, diff_lines, emphasize_prompt,
-        expanded_agent_results, format_update, highlight_answer, latest_agent_response, prompt,
-        ready_references, render_agent, render_session_agent, reset_state, resolve_references,
-        session_context, shortened_path, start_agents, AgentDisplay, AgentLabel, AgentUpdate,
-        PromptLine, ReferenceResolution, Styling, Workers,
+        expanded_agent_results, format_elapsed, format_update, highlight_answer,
+        latest_agent_response, prompt, ready_references, render_agent, render_session_agent,
+        reset_state, resolve_references, session_context, shortened_path, start_agents,
+        AgentDisplay, AgentLabel, AgentUpdate, PromptLine, ReferenceResolution, Styling, Workers,
     };
     use crate::session::{
         AgentAccess, AgentModel, AgentOptions, AgentTask, DiffMode, DisplayDetail, Event,
@@ -2575,6 +2607,7 @@ mod tests {
     };
     use crate::terminal::Terminal;
     use std::path::Path;
+    use std::time::Duration;
 
     #[test]
     fn conversation_context_retains_early_instructions_and_large_replies() {
@@ -2903,6 +2936,7 @@ mod tests {
         }
         format_update(
             AgentUpdate {
+                elapsed: Duration::ZERO,
                 id: 1,
                 model: "opus".into(),
                 access: AgentAccess::ReadWrite,
@@ -3000,6 +3034,7 @@ mod tests {
         let sender = std::thread::spawn(move || {
             std::thread::sleep(std::time::Duration::from_millis(10));
             tx.send(super::WorkerUpdate::Agent(AgentUpdate {
+                elapsed: Duration::ZERO,
                 id: 7,
                 model: "opus".into(),
                 access: AgentAccess::ReadOnly,
@@ -3024,6 +3059,7 @@ mod tests {
         workers
             .worker_tx
             .send(super::WorkerUpdate::Agent(AgentUpdate {
+                elapsed: Duration::ZERO,
                 id: 8,
                 model: "luna".into(),
                 access: AgentAccess::ReadOnly,
@@ -3075,6 +3111,7 @@ mod tests {
         let mut workers = Workers::new(false);
         let final_line = format_update(
             AgentUpdate {
+                elapsed: Duration::ZERO,
                 id: 1,
                 model: "opus".into(),
                 access: AgentAccess::ReadWrite,
@@ -3107,6 +3144,7 @@ mod tests {
         let mut workers = Workers::new(false);
         let line = format_update(
             AgentUpdate {
+                elapsed: Duration::ZERO,
                 id: 1,
                 model: "opus".into(),
                 access: AgentAccess::ReadOnly,
@@ -3130,7 +3168,7 @@ mod tests {
         );
         assert_eq!(
             expanded_agent_results(&mut session),
-            ["opus?#1 prompt: Inspect this\nopus?#1 [used claude-fable-5-1]: Done"]
+            ["opus?#1 prompt: Inspect this\nopus?#1 [used claude-fable-5-1; 0.0s]: Done"]
         );
     }
 
@@ -3146,6 +3184,7 @@ mod tests {
         let mut workers = Workers::new(false);
         let line = format_update(
             AgentUpdate {
+                elapsed: Duration::from_millis(12_400),
                 id: 1,
                 model: "luna".into(),
                 access: AgentAccess::ReadOnly,
@@ -3159,7 +3198,14 @@ mod tests {
         );
         assert_eq!(line, "luna?#1: Looks fine");
         assert_eq!(expanded_agent_results(&mut session),
-            ["luna?#1 prompt: Inspect this\nluna?#1 [requested gpt-6-luna; actual model unreported]: Looks fine"]);
+            ["luna?#1 prompt: Inspect this\nluna?#1 [requested gpt-6-luna; actual model unreported; 12.4s]: Looks fine"]);
+    }
+
+    #[test]
+    fn response_times_use_seconds_then_minutes() {
+        assert_eq!(format_elapsed(Duration::from_millis(840)), "0.8s");
+        assert_eq!(format_elapsed(Duration::from_millis(59_940)), "59.9s");
+        assert_eq!(format_elapsed(Duration::from_secs(185)), "3m 05s");
     }
 
     #[test]
@@ -3194,6 +3240,7 @@ mod tests {
         assert_eq!(session.last_status, 0);
         assert!(old_sender
             .send(super::WorkerUpdate::Agent(super::AgentUpdate {
+                elapsed: Duration::ZERO,
                 id: 1,
                 model: "codex".into(),
                 access: AgentAccess::ReadOnly,
@@ -3310,6 +3357,7 @@ mod tests {
         let mut workers = Workers::new(false);
         let output = format_update(
             AgentUpdate {
+                elapsed: Duration::ZERO,
                 id: 2,
                 model: "luna".into(),
                 access: AgentAccess::ReadOnly,
@@ -3330,7 +3378,7 @@ mod tests {
         );
         assert_eq!(
             expanded_agent_results(&mut session),
-            ["luna?#2 prompt: Check the tests\nluna?#2: Tests pass"]
+            ["luna?#2 prompt: Check the tests\nluna?#2 [0.0s]: Tests pass"]
         );
     }
 
@@ -3348,6 +3396,7 @@ mod tests {
         assert_eq!(
             format_update(
                 AgentUpdate {
+                    elapsed: Duration::ZERO,
                     id: 3,
                     model: "opus".into(),
                     access: AgentAccess::ReadOnly,
@@ -3561,6 +3610,7 @@ mod tests {
 
         format_update(
             AgentUpdate {
+                elapsed: Duration::ZERO,
                 id: 2,
                 model: "sol".into(),
                 access: AgentAccess::ReadOnly,
@@ -3748,6 +3798,7 @@ mod tests {
         workers
             .worker_tx
             .send(super::WorkerUpdate::Agent(AgentUpdate {
+                elapsed: Duration::ZERO,
                 id: 1,
                 model: "sol".into(),
                 access: AgentAccess::ReadOnly,

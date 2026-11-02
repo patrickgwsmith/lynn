@@ -3,7 +3,7 @@ use crate::agent_cli::ModelInfo;
 use crate::shell::ShellExecution;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 pub struct Session {
     pub cwd: PathBuf,
@@ -16,6 +16,8 @@ pub struct Session {
     pub expanded_response_ids: BTreeSet<usize>,
     pub agent_efforts: BTreeMap<usize, ReasoningEffort>,
     pub model_details: BTreeMap<usize, ModelInfo>,
+    /// How long each agent took to reply, shown in expanded results.
+    pub agent_elapsed: BTreeMap<usize, Duration>,
     pub streaming_agents: BTreeSet<usize>,
     /// The Pi model from the latest `pi.<model>?`, used by `pi?` and `pi!`.
     pub pi_model: Option<String>,
@@ -361,6 +363,7 @@ impl Session {
             expanded_response_ids: BTreeSet::new(),
             agent_efforts: BTreeMap::new(),
             model_details: BTreeMap::new(),
+            agent_elapsed: BTreeMap::new(),
             streaming_agents: BTreeSet::new(),
             pi_model: None,
             pi_models: BTreeMap::new(),
