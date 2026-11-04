@@ -729,6 +729,32 @@ pub fn agent_reference(token: &str) -> Option<(&str, Option<AgentAccess>, usize)
     ))
 }
 
+/// Words that could be session references, with their byte offsets in `text`.
+/// URL words are skipped so fragments and paths are not read as references.
+pub fn reference_tokens(text: &str) -> impl Iterator<Item = (usize, &str)> {
+    let is_token_char = |character: char| {
+        character.is_ascii_alphanumeric() || matches!(character, '#' | '.' | '_' | '-' | '?' | '!')
+    };
+    text.split_whitespace()
+        .filter(|word| !word.contains("://"))
+        .flat_map(move |word| {
+            let word_start = word.as_ptr() as usize - text.as_ptr() as usize;
+            word.split(move |character: char| !is_token_char(character))
+                .map(move |raw| {
+                    let start = word_start + (raw.as_ptr() as usize - word.as_ptr() as usize);
+                    (start, raw.trim_end_matches(['.', '?', '!']))
+                })
+        })
+        .filter(|(_, token)| !token.is_empty())
+}
+
+/// Whether `token` has the shape of a reply, result or watch revision reference.
+pub fn is_reference(token: &str) -> bool {
+    watch_revision_reference(token).is_some()
+        || agent_reference(token).is_some()
+        || agent_number_reference(token).is_some()
+}
+
 pub fn agent_number_reference(token: &str) -> Option<usize> {
     let number = token.strip_prefix('#')?;
     // Six digits reads as a hex colour like #123456, not a reference.

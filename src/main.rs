@@ -2460,22 +2460,7 @@ fn resolve_references(
             pending.insert(id);
         }
     }
-    // Skip URL words so fragments and paths are not read as references.
-    let task = task
-        .split_whitespace()
-        .filter(|word| !word.contains("://"))
-        .collect::<Vec<_>>()
-        .join(" ");
-    for raw_token in task.split(|character: char| {
-        !(character.is_ascii_alphanumeric()
-            || character == '#'
-            || character == '.'
-            || character == '_'
-            || character == '-'
-            || character == '?'
-            || character == '!')
-    }) {
-        let token = raw_token.trim_end_matches(['.', '?', '!']);
+    for (_, token) in session::reference_tokens(task) {
         let reference = if let Some((id, revision)) = session::watch_revision_reference(token) {
             let watch = session
                 .live_commands

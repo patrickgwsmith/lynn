@@ -884,7 +884,12 @@ fn write_input_parts(mut output: impl Write, line: &str, style: InputStyle) -> i
                 return write_input_parts(output, &line[end..], style);
             }
         }
-        output.write_all(&line.as_bytes()[end..])?;
+        if kind == SelectorKind::Agent {
+            // Colour `#3`, `opus#3` and `#3.2` so a reference typed by accident shows up.
+            write_references(&mut output, &line[end..], style)?;
+        } else {
+            output.write_all(&line.as_bytes()[end..])?;
+        }
     } else if matches!(style, InputStyle::Entered) {
         if let Some((start, end)) = unknown_command_span(line) {
             write!(
@@ -901,6 +906,28 @@ fn write_input_parts(mut output: impl Write, line: &str, style: InputStyle) -> i
         output.write_all(line.as_bytes())?;
     }
     Ok(())
+}
+
+const REFERENCE_ANSI: &str = "\x1b[1;36m";
+
+fn write_references(mut output: impl Write, text: &str, style: InputStyle) -> io::Result<()> {
+    let mut written = 0;
+    for (start, token) in crate::session::reference_tokens(text) {
+        if !crate::session::is_reference(token) {
+            continue;
+        }
+        let end = start + token.len();
+        write!(
+            output,
+            "{}{REFERENCE_ANSI}{token}\x1b[0m",
+            &text[written..start]
+        )?;
+        if matches!(style, InputStyle::Entered) {
+            output.write_all(b"\x1b[1m")?;
+        }
+        written = end;
+    }
+    output.write_all(&text.as_bytes()[written..])
 }
 
 fn unknown_command_span(line: &str) -> Option<(usize, usize)> {
@@ -1583,7 +1610,10 @@ mod tests {
         assert_eq!(output, b"\x1b[1m\x1b[1;35myes!\x1b[0m\x1b[1m\x1b[0m");
         output.clear();
         write_entered_input(&mut output, "yes! #3", true).unwrap();
-        assert_eq!(output, b"\x1b[1m\x1b[1;35myes!\x1b[0m\x1b[1m #3\x1b[0m");
+        assert_eq!(
+            output,
+            b"\x1b[1m\x1b[1;35myes!\x1b[0m\x1b[1m \x1b[1;36m#3\x1b[0m\x1b[1m\x1b[0m"
+        );
         output.clear();
         write_input(&mut output, "yes", true).unwrap();
         assert_eq!(output, b"\x1b[1;35myes\x1b[0m");
@@ -1595,6 +1625,22 @@ mod tests {
         // `@staffer yes!` is rejected, so only `@staffer` is coloured.
         write_input(&mut output, "@staffer yes!", true).unwrap();
         assert_eq!(output, b"\x1b[1;34m@staffer\x1b[0m yes!");
+    }
+
+    #[test]
+    fn agent_prompts_colour_references() {
+        assert_eq!(
+            styled_input("opus? compare #3 with opus?#12, #4.2 and #1.", true),
+            "\x1b[1;35mopus?\x1b[0m compare \x1b[1;36m#3\x1b[0m with \
+             \x1b[1;36mopus?#12\x1b[0m, \x1b[1;36m#4.2\x1b[0m and \x1b[1;36m#1\x1b[0m."
+        );
+        // Escaped, hex-colour, zero-led and URL-fragment forms are not references.
+        assert_eq!(
+            styled_input(r"opus? not #\1, #123456, #01 or https://x.dev/#2", true),
+            "\x1b[1;35mopus?\x1b[0m not #\\1, #123456, #01 or https://x.dev/#2"
+        );
+        // Shell commands keep their own reference handling and are not coloured.
+        assert_eq!(styled_input("cat #3", true), "cat #3");
     }
 
     #[test]
