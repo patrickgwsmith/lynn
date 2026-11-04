@@ -315,6 +315,19 @@ fn pending_agent_statuses_with_width(
             .pending_prompts
             .get(&id)
             .filter(|prompt| prompt.shown);
+        // A bare `opus!#28: …` says nothing, so the prompt takes its place
+        // on one line instead of adding a second.
+        if let (false, Some(prompt), Some(label)) =
+            (expanded, pending_prompt, status.strip_suffix(": …"))
+        {
+            if let Some(input) = request_input(session, id) {
+                let prefix = format!("{label}: ");
+                let text = prompt.summary.as_deref().unwrap_or(input);
+                let text = one_line_prompt(text, prompt_room(&prefix, columns));
+                statuses.push(format!("{prefix}{}", emphasize_prompt(&text, color)));
+                continue;
+            }
+        }
         if expanded || pending_prompt.is_some() {
             if let Some(label) = agent_label_by_id(session, id) {
                 if let Some(input) = request_input(session, id) {
@@ -3348,6 +3361,23 @@ mod tests {
             &mut workers,
         );
         assert!(!workers.pending_prompts.contains_key(&4));
+        // A revealed prompt replaces a bare `…` status on the same line, in
+        // compact detail only.
+        workers.pending_agents.insert(5, "opus!#5: …".into());
+        assert_eq!(
+            super::pending_agent_statuses_with_width(&session, &workers, false, 80),
+            ["opus!#5: Update the tests", "opus?#6: …"]
+        );
+        assert_eq!(
+            super::pending_agent_statuses_with_width(&session, &workers, false, 20)[0],
+            "opus!#5: Update th…"
+        );
+        session.detail = DisplayDetail::Expanded;
+        assert_eq!(
+            super::pending_agent_statuses_with_width(&session, &workers, false, 80)[..2],
+            ["opus!#5 prompt: Update the tests", "opus!#5: …"]
+        );
+        session.detail = DisplayDetail::Compact;
         assert!(super::prompt_fits("  one line  ", 8));
         assert!(!super::prompt_fits("one\ntwo", 80));
         assert!(!super::prompt_fits("too long", 7));
