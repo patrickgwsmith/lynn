@@ -68,7 +68,9 @@ Lynn supports these agent names:
 
 Each request runs in the background. You can continue to type commands while the agent works.
 
-Mutating requests (`!`, `!!`, `!!!`, and `?!`) share one serial queue across all models in this Lynn session. For example, `sol!` waits for an earlier `opus!` to finish or fail. Lynn shows `queued behind mutating request #n` while waiting and builds the request's context when it starts. An earlier mutating request waiting for referenced results keeps its place in the queue.
+Mutating requests (`!`, `!!`, `!!!`, and `?!`) share one serial queue across all models in this Lynn session. For example, `sol!` waits for an earlier `opus!` to finish or fail. Lynn shows the request it is waiting on, such as `sol!#5: waiting for opus!#4`, and builds the request's context when it starts. An earlier mutating request waiting for referenced results keeps its place in the queue.
+
+To steer queued requests, start typing a `#` note. As soon as the line starts with `#`, queued requests stop launching and show `paused while you write a # note`. The request already running carries on. When you press Enter (or clear the line, or press Ctrl-C), the queue resumes, and the next request starts with your note in its context.
 
 Read-only requests (`?`, `??`, and `???`) run in parallel without waiting for the write queue, unless they explicitly refer to an unfinished result. A bare interactive write selector such as `codex!` waits for queued mutations before opening its CLI. The write reservation survives `reset` until an already running mutation finishes. This queue coordinates agents in one Lynn process; ordinary shell commands and other Lynn processes are independent.
 
@@ -147,7 +149,7 @@ Each request gets a label, for example `codex?#3` for read-only access or `opus!
 - When the answer is ready, Lynn shows `codex?#3: answer`.
 - Press Down at an empty prompt to show each running or queued request above its status line, and expand existing replies with their original requests and model details. Claude Code reports the model or models used in `modelUsage`, for example `opus?#3 [used claude-opus-5-5]: answer`. Codex does not report the actual model in its result events, so Lynn shows its explicitly requested model as unverified, for example `[requested gpt-6-luna; actual model unreported]`. The detail also shows how long the agent took to reply, for example `opus?#3 [used claude-opus-5-5; 12.4s]`, counted from when the agent started, so time spent queued or waiting for a referenced reply is not included. Compact replies and `#3` recall omit this detail.
 - To show the latest completed agent reply, enter `#`. To show a specific full answer, enter `#3` or `codex?#3`. Older labels such as `codex#3` also work.
-- To answer an agent's question with yes, enter `yes`. Lynn sends `yes #n` to the same agent that wrote the latest reply, with the same access and effort. To reply to a specific answer, enter `yes #3`; if #3 was an `opus?` request, this is the same as `opus? yes #3`. A read-only agent cannot act on a plain `yes`, so to let it go ahead and change files, enter `yes!` or `yes! #3`. To run the `yes` command, enter `bash! yes`.
+- To answer an agent's question with yes, enter `yes`. Lynn sends `yes #n` to the same agent that wrote the latest reply, with the same access, effort and Unix user, so a reply to an `@staffer opus?` answer also runs as `staffer`. To reply to a specific answer, enter `yes #3`; if #3 was an `opus?` request, this is the same as `opus? yes #3`. A read-only agent cannot act on a plain `yes`, so to let it go ahead and change files, enter `yes!` or `yes! #3`. To run the `yes` command, enter `bash! yes`. You don't need to write `@staffer yes`, and Lynn doesn't accept it.
 - Claude, Codex, Pi, fx, agy, and fm read-only agents are asked for a concise one-line answer, preferably under 40 words, unless you explicitly request more detail or a structured answer. Lynn displays their replies without clipping; long lines wrap on screen.
 - To give an answer to a different agent, refer to it in the request. For example: `claude? do you agree with #3?`
 - If a request refers to an unfinished answer, Lynn queues it in the background, shows `waiting for #3`, and starts it when the answer arrives. A request with several references waits for all of them. Lynn builds the queued request's context after those answers enter the session log and includes each referenced answer once. If a referenced request fails, the queued request reports the failure.
@@ -208,7 +210,7 @@ For a summary of earlier session results, such as `fm? summarize the ops/s`, Lyn
 
 For an ordinary command such as `git status`, Lynn shows you the output in the terminal, but gives agents only the command text and exit status. It does not add that command's stdout or stderr to the shared session.
 
-Agent requests receive the full session history of commands, comments, agent requests, and replies, plus current todos. Older instructions are retained until `reset` or exit; Lynn does not drop conversation events by count or truncate the assembled conversation. Watched outputs and web pages use bounded excerpts with visible omission markers. Explicit `#n` references supply stored results without duplicating them in the automatic context. Long sessions therefore produce larger prompts; there is no automatic conversation summarization.
+Agent requests receive the full session history of commands, comments, agent requests, and replies, plus current todos. Older instructions are retained until `reset` or exit; Lynn does not drop conversation events by count or truncate the assembled conversation. Watched outputs and web pages use bounded excerpts with visible omission markers; HTML pages are excerpted as their text, without styles, scripts, SVG, or navigation. Explicit `#n` references supply stored results without duplicating them in the automatic context. Long sessions therefore produce larger prompts; there is no automatic conversation summarization.
 
 Agents are asked to cite numbered session messages such as `#25` when those messages materially inform an answer. These are the agent's attributions; Lynn does not treat them as a complete or independently verified record of everything that influenced its response.
 
@@ -387,7 +389,7 @@ Tab completion accepts relative paths, absolute paths, and paths that start with
 
 Type `!` at an empty prompt and press Tab to recall the last command if it was a read-only agent request. For example, `opus? explain this` becomes `opus! explain this`, preserving the instruction. Repeated question marks become matching exclamation marks (`sol??` becomes `sol!!`). The recalled request stays in the editor until you press Enter. This shortcut uses only the most recent command and applies to requests for a single agent.
 
-Type `?` at an empty prompt and press Tab to recall the most recently used agent selector without its instruction, for example `opus?`. This searches back past ordinary commands and always uses read-only access with the default reasoning effort.
+Type `?` at an empty prompt and press Tab or Space to recall the most recently used agent selector without its instruction, for example `opus? `, ready for you to type the request. This searches back past ordinary commands and always uses read-only access with the default reasoning effort.
 
 ## Limits of the protection
 

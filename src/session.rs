@@ -282,6 +282,8 @@ pub enum Event {
         id: usize,
         input: String,
         access: AgentAccess,
+        /// The account the request ran as, kept so `yes` replies as the same user.
+        user: AgentUser,
         model: Option<String>,
         effort: ReasoningEffort,
         output: AgentOutput,

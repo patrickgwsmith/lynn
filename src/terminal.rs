@@ -117,7 +117,7 @@ impl Terminal {
         todos: &[crate::session::Todo],
         mut statuses: Vec<String>,
         wake_fd: RawFd,
-        mut notices: impl FnMut() -> (Vec<String>, Vec<String>),
+        mut notices: impl FnMut(&[u8]) -> (Vec<String>, Vec<String>),
     ) -> io::Result<ReadResult> {
         let _raw = RawMode::new()?;
         let mut bytes = Vec::<u8>::new();
@@ -139,15 +139,14 @@ impl Terminal {
             let key = match read_byte_or_notice(wake_fd)? {
                 Some(key) => key,
                 None => {
-                    let (updates, new_statuses) = notices();
-                    if !updates.is_empty() || new_statuses != statuses {
-                        let mut stdout = io::stdout().lock();
-                        clear_editor(&mut stdout, status_rows, &mut display)?;
-                        write_notices(&mut stdout, &updates)?;
-                        statuses = new_statuses;
-                        status_rows = write_statuses(&mut stdout, &statuses)?;
-                        stdout.flush()?;
-                        drop(stdout);
+                    let (updates, new_statuses) = notices(&bytes);
+                    if show_notices(
+                        &updates,
+                        new_statuses,
+                        &mut statuses,
+                        &mut status_rows,
+                        &mut display,
+                    )? {
                         redraw(
                             &mut display,
                             &bytes,
@@ -398,12 +397,37 @@ impl Terminal {
                     display = EditorDisplay::default();
                     status_rows = write_statuses(io::stdout().lock(), &statuses)?;
                 }
+                b' ' if bytes == b"?" && cursor == 1 => {
+                    // `? text` has no meaning on its own, so a space after a
+                    // bare `?` recalls the latest agent selector like Tab.
+                    if let Some(completion) = history_completion("?", 1, &self.history) {
+                        let replacement = completion.matches[0].as_bytes();
+                        bytes.splice(
+                            completion.start..completion.end,
+                            replacement.iter().copied(),
+                        );
+                        cursor = completion.start + replacement.len();
+                    } else {
+                        bytes.insert(cursor, b' ');
+                        cursor += 1;
+                    }
+                }
                 c if c >= 32 => {
                     bytes.insert(cursor, c);
                     cursor += 1;
                 }
                 _ => {}
             }
+            // The caller sees each edit, so it can react to the line as it is
+            // typed (for example, holding queued agents while a `#` note is written).
+            let (updates, new_statuses) = notices(&bytes);
+            show_notices(
+                &updates,
+                new_statuses,
+                &mut statuses,
+                &mut status_rows,
+                &mut display,
+            )?;
             redraw(
                 &mut display,
                 &bytes,
@@ -414,6 +438,27 @@ impl Terminal {
             )?;
         }
     }
+}
+
+/// Prints background updates and replaces the status lines above the editor.
+/// Returns whether anything changed, in which case the editor must be redrawn.
+fn show_notices(
+    updates: &[String],
+    new_statuses: Vec<String>,
+    statuses: &mut Vec<String>,
+    status_rows: &mut usize,
+    display: &mut EditorDisplay,
+) -> io::Result<bool> {
+    if updates.is_empty() && new_statuses == *statuses {
+        return Ok(false);
+    }
+    let mut stdout = io::stdout().lock();
+    clear_editor(&mut stdout, *status_rows, display)?;
+    write_notices(&mut stdout, updates)?;
+    *statuses = new_statuses;
+    *status_rows = write_statuses(&mut stdout, statuses)?;
+    stdout.flush()?;
+    Ok(true)
 }
 
 fn prompt_for_display<'a>(short: &'a str, full: &'a str, detail: DisplayDetail) -> &'a str {
@@ -830,7 +875,14 @@ fn write_input_parts(mut output: impl Write, line: &str, style: InputStyle) -> i
             output.write_all(b"\x1b[1m")?;
         }
         if &line[start..end] == "@staffer" {
-            return write_input_parts(output, &line[end..], style);
+            // Only colour what follows when the line is an accepted staffer
+            // agent request, so `@staffer yes!` does not look like a reply.
+            if matches!(
+                crate::session::classify(&line[start..]),
+                crate::session::Input::Agents(_)
+            ) {
+                return write_input_parts(output, &line[end..], style);
+            }
         }
         output.write_all(&line.as_bytes()[end..])?;
     } else if matches!(style, InputStyle::Entered) {
@@ -958,6 +1010,15 @@ fn selector_highlight(line: &str) -> Option<(usize, usize, SelectorKind)> {
                 .is_some_and(|(_, suffix)| matches!(suffix, "?" | "!")))
     {
         SelectorKind::Agent
+    } else if !live
+        && matches!(selector, "yes" | "yes!")
+        && matches!(
+            crate::session::classify(rest),
+            crate::session::Input::Yes { .. }
+        )
+    {
+        // `yes`, `yes!` and `yes! #3` reply to an agent rather than run the `yes` command.
+        SelectorKind::Agent
     } else {
         return None;
     };
@@ -1019,7 +1080,7 @@ fn history_completion(line: &str, cursor: usize, history: &[String]) -> Option<C
                 _ => return None,
             };
             Some(format!(
-                "{}?",
+                "{}? ",
                 models
                     .iter()
                     .map(|model| model.name())
@@ -1517,6 +1578,23 @@ mod tests {
         output.clear();
         write_entered_input(&mut output, "ls", false).unwrap();
         assert_eq!(output, b"ls");
+        output.clear();
+        write_entered_input(&mut output, "yes!", true).unwrap();
+        assert_eq!(output, b"\x1b[1m\x1b[1;35myes!\x1b[0m\x1b[1m\x1b[0m");
+        output.clear();
+        write_entered_input(&mut output, "yes! #3", true).unwrap();
+        assert_eq!(output, b"\x1b[1m\x1b[1;35myes!\x1b[0m\x1b[1m #3\x1b[0m");
+        output.clear();
+        write_input(&mut output, "yes", true).unwrap();
+        assert_eq!(output, b"\x1b[1;35myes\x1b[0m");
+        output.clear();
+        // `yes hello` runs the shell's `yes`, so it is not an agent reply.
+        write_input(&mut output, "yes hello", true).unwrap();
+        assert_eq!(output, b"yes hello");
+        output.clear();
+        // `@staffer yes!` is rejected, so only `@staffer` is coloured.
+        write_input(&mut output, "@staffer yes!", true).unwrap();
+        assert_eq!(output, b"\x1b[1;34m@staffer\x1b[0m yes!");
     }
 
     #[test]
@@ -1605,13 +1683,13 @@ mod tests {
     #[test]
     fn question_tab_recalls_the_latest_agent_without_its_instruction() {
         for (previous, expected) in [
-            ("opus? explain this", "opus?"),
-            ("sol!!! implement this", "sol?"),
-            ("Opus?", "opus?"),
-            ("@staffer luna! implement this", "luna?"),
-            ("opus/luna?? compare", "opus/luna?"),
-            ("🎵 explain this", "opus?"),
-            ("fm?", "fm?"),
+            ("opus? explain this", "opus? "),
+            ("sol!!! implement this", "sol? "),
+            ("Opus?", "opus? "),
+            ("@staffer luna! implement this", "luna? "),
+            ("opus/luna?? compare", "opus/luna? "),
+            ("🎵 explain this", "opus? "),
+            ("fm?", "fm? "),
         ] {
             let history = vec![
                 "codex? older request".to_owned(),

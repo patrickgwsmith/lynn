@@ -5,6 +5,7 @@ mod codex;
 mod feed;
 mod fm;
 mod fx;
+mod html;
 mod http;
 mod inline;
 mod jsc;
@@ -419,6 +420,8 @@ struct Workers {
     /// In-flight GET requests by URL, so agent requests can wait for them.
     loading_urls: BTreeMap<String, usize>,
     queued_agents: BTreeMap<usize, QueuedAgent>,
+    /// Set while the input line starts with `#`, so queued agents wait for the note.
+    holding_for_note: bool,
     interactive: bool,
     next_http_id: usize,
     active_http: usize,
@@ -480,6 +483,7 @@ impl Workers {
             pending_http: BTreeMap::new(),
             loading_urls: BTreeMap::new(),
             queued_agents: BTreeMap::new(),
+            holding_for_note: false,
             interactive,
             next_http_id: 1,
             active_http: 0,
@@ -545,7 +549,8 @@ fn main() {
                 &todos,
                 statuses,
                 workers.wake_reader.as_raw_fd(),
-                || {
+                |line| {
+                    set_note_hold(&session, &mut workers, line.starts_with(b"#"));
                     let updates = drain_updates(&mut workers, &mut session);
                     let statuses = pending_agent_statuses(&session, &workers, color);
                     (updates, statuses)
@@ -558,11 +563,13 @@ fn main() {
                 Ok(ReadResult::Interrupt) => {
                     session.detail = DisplayDetail::Compact;
                     session.mode = PromptMode::Shell;
+                    set_note_hold(&session, &mut workers, false);
                     continue;
                 }
                 Ok(ReadResult::Eof) => break,
                 Ok(ReadResult::Expand) => {
                     session.detail = DisplayDetail::Expanded;
+                    set_note_hold(&session, &mut workers, false);
                     for result in expanded_agent_results(&mut session) {
                         println!("{result}");
                     }
@@ -576,6 +583,8 @@ fn main() {
             if let Some(status) = handle(&line, &mut session, &mut workers, &mut terminal) {
                 std::process::exit(status);
             }
+            // The note (if any) is now recorded, so queued agents can see it.
+            set_note_hold(&session, &mut workers, false);
         }
     } else {
         for line in io::stdin().lock().lines() {
@@ -1225,6 +1234,7 @@ fn resolve_inline(
                     id,
                     input: task.to_owned(),
                     access: AgentAccess::ReadOnly,
+                    user: AgentUser::Current,
                     model: Some(model.to_owned()),
                     effort: ReasoningEffort::Default,
                     output: AgentOutput::Final,
@@ -1333,6 +1343,7 @@ fn start_agents(request: AgentTask<'_>, session: &mut Session, workers: &mut Wor
             id,
             input: task.into(),
             access: options.access,
+            user: options.user,
             model: Some(model.name().to_owned()),
             effort: options.effort,
             output: options.output,
@@ -1354,7 +1365,7 @@ fn start_agents(request: AgentTask<'_>, session: &mut Session, workers: &mut Wor
                 format!("{label}: …")
             }
             (_, Some(predecessor)) => {
-                let status = format!("{label}: queued behind mutating request #{predecessor}");
+                let status = queued_behind_status(&request, predecessor, session);
                 workers.pending_agents.insert(id, status.clone());
                 workers.queued_agents.insert(id, request);
                 status
@@ -1391,6 +1402,15 @@ fn mutating_predecessor(request: &QueuedAgent, workers: &Workers) -> Option<usiz
             })
             .map(|earlier| earlier.id)
     })
+}
+
+/// The status of a mutating request queued behind another, such as
+/// `opus!#7: waiting for opus!#4`.
+fn queued_behind_status(request: &QueuedAgent, predecessor: usize, session: &Session) -> String {
+    let predecessor = agent_label_by_id(session, predecessor)
+        .map(|label| label.to_string())
+        .unwrap_or_else(|| format!("#{predecessor}"));
+    format!("{}: waiting for {predecessor}", request.label())
 }
 
 fn wait_for_writers(session: &mut Session, workers: &mut Workers) {
@@ -1970,13 +1990,18 @@ fn session_context_filtered(
                 id,
                 input,
                 access,
+                user,
                 model,
                 ..
             } => context.push_str(&format!(
-                "request ({}, {}): {input}\n",
+                "request ({}, {}{}): {input}\n",
                 AgentLabel::new(model.as_deref().unwrap_or("default"), *access, *id)
                     .in_session(session),
-                access.description()
+                access.description(),
+                match user {
+                    AgentUser::Current => "",
+                    AgentUser::Staffer => ", staffer",
+                }
             )),
             Event::AgentResponse {
                 id, model, text, ..
@@ -1987,12 +2012,22 @@ fn session_context_filtered(
                 context.push_str(&format!("response ({label}): {text}\n"))
             }
             Event::Resource { id, resource } => {
+                // Show an HTML page's text, not its markup: inline CSS and
+                // scripts can otherwise fill the whole excerpt.
+                let (text, note) = if html::is_html(&resource.content_type) {
+                    (
+                        html::text(&resource.content).into(),
+                        ", page text without markup",
+                    )
+                } else {
+                    (std::borrow::Cow::Borrowed(resource.content.as_str()), "")
+                };
                 context.push_str(&format!(
-                    "resource: {} ({})\n",
+                    "resource: {} ({}{note})\n",
                     resource_label(resource),
                     resource.content_type
                 ));
-                let mut content = resource.content.chars();
+                let mut content = text.chars();
                 context.extend(content.by_ref().take(8_000));
                 context.push('\n');
                 if content.next().is_some() {
@@ -2076,6 +2111,9 @@ fn reply_yes(
     };
     let Some((model, id, options)) = label.and_then(|label| {
         let options = AgentOptions {
+            // Reply as the account that wrote the answer, so `yes` to
+            // `@staffer opus?` stays with staffer.
+            user: agent_user_by_id(session, label.id),
             effort: label.effort,
             output: label.output,
             ..AgentOptions::new(access.unwrap_or(label.access))
@@ -2140,6 +2178,22 @@ fn agent_label_by_id(session: &Session, id: usize) -> Option<AgentLabel<'_>> {
         } if *request_id == id => Some(AgentLabel::new(model, *access, id).in_session(session)),
         _ => None,
     })
+}
+
+/// The account the agent request with this id ran as.
+fn agent_user_by_id(session: &Session, id: usize) -> AgentUser {
+    session
+        .events
+        .iter()
+        .find_map(|event| match event {
+            Event::AgentRequest {
+                id: request_id,
+                user,
+                ..
+            } if *request_id == id => Some(*user),
+            _ => None,
+        })
+        .unwrap_or(AgentUser::Current)
 }
 
 fn http_response_by_id(session: &Session, id: usize) -> Option<String> {
@@ -2658,7 +2712,25 @@ fn format_update(update: AgentUpdate, session: &mut Session, workers: &mut Worke
     line
 }
 
+/// Holds queued agents while the user writes a `#` note, and resumes them once
+/// the hold ends so they launch with the note in their context.
+fn set_note_hold(session: &Session, workers: &mut Workers, holding: bool) {
+    if workers.holding_for_note != holding {
+        workers.holding_for_note = holding;
+        resume_queued_agents(session, workers);
+    }
+}
+
 fn resume_queued_agents(session: &Session, workers: &mut Workers) {
+    if workers.holding_for_note {
+        for (&id, request) in &workers.queued_agents {
+            workers.pending_agents.insert(
+                id,
+                format!("{}: paused while you write a # note", request.label()),
+            );
+        }
+        return;
+    }
     let ids: Vec<usize> = workers.queued_agents.keys().copied().collect();
     for id in ids {
         let Some(request) = workers.queued_agents.get(&id) else {
@@ -2668,13 +2740,8 @@ fn resume_queued_agents(session: &Session, workers: &mut Workers) {
         match resolution {
             Ok(ReferenceResolution::Ready(references)) => {
                 if let Some(predecessor) = mutating_predecessor(request, workers) {
-                    workers.pending_agents.insert(
-                        id,
-                        format!(
-                            "{}: queued behind mutating request #{predecessor}",
-                            request.label()
-                        ),
-                    );
+                    let status = queued_behind_status(request, predecessor, session);
+                    workers.pending_agents.insert(id, status);
                 } else {
                     let request = workers.queued_agents.remove(&id).unwrap();
                     launch_agent(request, references, session, workers);
@@ -2713,6 +2780,7 @@ mod tests {
         reset_state, resolve_references, session_context, shortened_path, start_agents,
         AgentDisplay, AgentLabel, AgentUpdate, PromptLine, ReferenceResolution, Styling, Workers,
     };
+    use crate::agent_cli::AgentUser;
     use crate::session::{
         AgentAccess, AgentModel, AgentOptions, AgentOutput, AgentTask, DiffMode, DisplayDetail,
         Event, PromptMode, ReasoningEffort, Session,
@@ -2731,6 +2799,7 @@ mod tests {
             id: 1,
             input: "Keep mutating agents serial across all models".into(),
             access: AgentAccess::ReadWrite,
+            user: AgentUser::Current,
             model: Some("opus".into()),
             effort: ReasoningEffort::Default,
             output: AgentOutput::Final,
@@ -2808,6 +2877,31 @@ mod tests {
             super::session_context_filtered(&session, &references.ids, None, &session.cwd);
         assert!(!automatic.contains("resource:"));
         assert!(automatic.contains("comment: Preserve this instruction\n"));
+    }
+
+    #[test]
+    fn html_excerpts_skip_inline_styles_and_references_keep_markup() {
+        let mut session = Session::new().unwrap();
+        session.events.push(Event::Resource {
+            id: 4,
+            resource: crate::session::Resource {
+                body_url: "https://example.com/docs".into(),
+                redirect_targets: Default::default(),
+                content_type: "text/html; charset=utf-8".into(),
+                content: format!(
+                    "<html><head><style>{}</style></head><body><p>Article text</p></body></html>",
+                    ".a { color: red }\n".repeat(1_000)
+                ),
+            },
+        });
+        let context = session_context(&session);
+        assert!(context.contains("(text/html; charset=utf-8, page text without markup)"));
+        assert!(context.contains("Article text"));
+        assert!(!context.contains("color: red"));
+        assert!(!context.contains("more web page content omitted"));
+        let workers = Workers::new(false);
+        let references = ready_references("Read #4", &session, &workers).unwrap();
+        assert!(references.text.contains("<p>Article text</p>"));
     }
 
     #[test]
@@ -2890,17 +2984,13 @@ mod tests {
         let mut workers = Workers::new(false);
         for (id, model, input, status) in [
             (4, "opus", "Implement cancellation", "opus!#4: …"),
-            (
-                5,
-                "sol",
-                "Update the tests",
-                "sol!#5: queued behind mutating request #4",
-            ),
+            (5, "sol", "Update the tests", "sol!#5: waiting for opus!#4"),
         ] {
             session.events.push(Event::AgentRequest {
                 id,
                 input: input.into(),
                 access: AgentAccess::ReadWrite,
+                user: AgentUser::Current,
                 model: Some(model.into()),
                 effort: ReasoningEffort::Default,
                 output: AgentOutput::Final,
@@ -2910,7 +3000,7 @@ mod tests {
         }
         assert_eq!(
             super::pending_agent_statuses(&session, &workers, false),
-            ["opus!#4: …", "sol!#5: queued behind mutating request #4",]
+            ["opus!#4: …", "sol!#5: waiting for opus!#4",]
         );
         session.detail = DisplayDetail::Expanded;
         assert!(expanded_agent_results(&mut session).is_empty());
@@ -2920,7 +3010,7 @@ mod tests {
                 "opus!#4 prompt: Implement cancellation",
                 "opus!#4: …",
                 "sol!#5 prompt: Update the tests",
-                "sol!#5: queued behind mutating request #4",
+                "sol!#5: waiting for opus!#4",
             ]
         );
         workers
@@ -2938,7 +3028,7 @@ mod tests {
             super::pending_agent_statuses(&session, &workers, false),
             [
                 "sol!#5 prompt: Update the tests",
-                "sol!#5: queued behind mutating request #4",
+                "sol!#5: waiting for opus!#4",
             ]
         );
         // Expanding a pending status must not mark a future answer as already expanded.
@@ -2953,6 +3043,7 @@ mod tests {
             id: 4,
             input: "Implement cancellation\nPreserve existing labels".into(),
             access: AgentAccess::ReadWrite,
+            user: AgentUser::Current,
             model: Some("opus".into()),
             effort: ReasoningEffort::Default,
             output: AgentOutput::Live,
@@ -2988,6 +3079,7 @@ mod tests {
             id: 1,
             input: "first change".into(),
             access: AgentAccess::ReadWrite,
+            user: AgentUser::Current,
             model: Some("opus".into()),
             effort: ReasoningEffort::Default,
             output: AgentOutput::Final,
@@ -3008,8 +3100,8 @@ mod tests {
             workers.queued_agents.keys().copied().collect::<Vec<_>>(),
             [2, 3]
         );
-        assert!(workers.pending_agents[&2].contains("mutating request #1"));
-        assert!(workers.pending_agents[&3].contains("mutating request #1"));
+        assert_eq!(workers.pending_agents[&2], "opus!#2: waiting for opus!#1");
+        assert_eq!(workers.pending_agents[&3], "sol!#3: waiting for opus!#1");
         assert_eq!(workers.running_writer, Some(1));
 
         start_agents(
@@ -3036,6 +3128,54 @@ mod tests {
     }
 
     #[test]
+    fn yes_replies_as_the_user_that_ran_the_request() {
+        let mut session = Session::new().unwrap();
+        let mut workers = Workers::new(false);
+        // A running write keeps the `yes!` replies queued instead of launching.
+        workers.running_writer = Some(1);
+        workers.next_agent_id = 3;
+        workers.pending_agents.insert(1, "opus!#1: …".into());
+        workers.active_agents = 1;
+        for (id, user) in [(1, AgentUser::Current), (2, AgentUser::Staffer)] {
+            session.events.push(Event::AgentRequest {
+                id,
+                input: "inspect".into(),
+                access: AgentAccess::ReadOnly,
+                user,
+                model: Some("opus".into()),
+                effort: ReasoningEffort::Default,
+                output: AgentOutput::Final,
+                pi_model: None,
+            });
+            session.events.push(Event::AgentResponse {
+                id,
+                model: "opus".into(),
+                text: "Shall I go ahead?".into(),
+                model_info: None,
+                elapsed: None,
+            });
+        }
+        super::reply_yes(
+            Some(2),
+            Some(AgentAccess::ReadWrite),
+            &mut session,
+            &mut workers,
+        );
+        super::reply_yes(
+            Some(1),
+            Some(AgentAccess::ReadWrite),
+            &mut session,
+            &mut workers,
+        );
+        assert_eq!(workers.queued_agents[&3].options.user, AgentUser::Staffer);
+        assert_eq!(workers.queued_agents[&4].options.user, AgentUser::Current);
+        assert!(
+            session_context(&session).contains("request (opus!#3, read-write, staffer): yes #2\n")
+        );
+        assert!(session_context(&session).contains("request (opus!#4, read-write): yes #1\n"));
+    }
+
+    #[test]
     fn later_writes_do_not_overtake_an_earlier_write_waiting_for_references() {
         let mut session = Session::new().unwrap();
         let mut workers = Workers::new(false);
@@ -3046,6 +3186,7 @@ mod tests {
             id: 1,
             input: "research".into(),
             access: AgentAccess::ReadOnly,
+            user: AgentUser::Current,
             model: Some("opus".into()),
             effort: ReasoningEffort::Default,
             output: AgentOutput::Final,
@@ -3067,10 +3208,7 @@ mod tests {
         }
         assert_eq!(workers.running_writer, None);
         assert_eq!(workers.pending_agents[&2], "opus!#2: waiting for #1");
-        assert_eq!(
-            workers.pending_agents[&3],
-            "sol!#3: queued behind mutating request #2"
-        );
+        assert_eq!(workers.pending_agents[&3], "sol!#3: waiting for opus!#2");
         assert_eq!(
             super::mutating_predecessor(&workers.queued_agents[&3], &workers),
             Some(2)
@@ -3089,6 +3227,7 @@ mod tests {
             id: 1,
             input: "first change".into(),
             access: AgentAccess::ReadWrite,
+            user: AgentUser::Current,
             model: Some("opus".into()),
             effort: ReasoningEffort::Default,
             output: AgentOutput::Final,
@@ -3141,6 +3280,77 @@ mod tests {
     }
 
     #[test]
+    fn typing_a_note_pauses_queued_agents_until_it_is_entered() {
+        let mut session = Session::new().unwrap();
+        let mut workers = Workers::new(false);
+        workers.running_writer = Some(1);
+        workers.next_agent_id = 2;
+        workers.pending_agents.insert(1, "opus!#1: …".into());
+        workers.active_agents = 1;
+        session.events.push(Event::AgentRequest {
+            id: 1,
+            input: "first change".into(),
+            access: AgentAccess::ReadWrite,
+            user: AgentUser::Current,
+            model: Some("opus".into()),
+            effort: ReasoningEffort::Default,
+            output: AgentOutput::Final,
+            pi_model: None,
+        });
+        start_agents(
+            AgentTask {
+                task: "inspect",
+                models: vec![AgentModel::Jsc],
+                options: AgentOptions {
+                    output: crate::session::AgentOutput::Live,
+                    ..AgentOptions::new(AgentAccess::ReadWrite)
+                },
+            },
+            &mut session,
+            &mut workers,
+        );
+        assert_eq!(workers.pending_agents[&2], "jsc?!#2: waiting for opus!#1");
+
+        super::set_note_hold(&session, &mut workers, true);
+        assert_eq!(
+            workers.pending_agents[&2],
+            "jsc?!#2: paused while you write a # note"
+        );
+        // The running request is not paused.
+        assert_eq!(workers.pending_agents[&1], "opus!#1: …");
+
+        // #1 finishing while the note is being written must not launch #2.
+        format_update(
+            AgentUpdate {
+                elapsed: Duration::ZERO,
+                id: 1,
+                model: "opus".into(),
+                access: AgentAccess::ReadWrite,
+                result: Ok("first change completed".into()),
+            },
+            &mut session,
+            &mut workers,
+        );
+        assert_eq!(workers.running_writer, None);
+        assert!(workers.queued_agents.contains_key(&2));
+        assert_eq!(
+            workers.pending_agents[&2],
+            "jsc?!#2: paused while you write a # note"
+        );
+
+        session.events.push(Event::Comment("steer this way".into()));
+        super::set_note_hold(&session, &mut workers, false);
+        assert!(workers.queued_agents.is_empty());
+        assert_eq!(workers.running_writer, Some(2));
+        let update = workers
+            .worker_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+        super::format_worker_update(update, &mut session, &mut workers);
+        assert_eq!(workers.running_writer, None);
+    }
+
+    #[test]
     fn shell_references_select_replies_http_results_and_watch_revisions() {
         let mut session = Session::new().unwrap();
         let mut workers = Workers::new(false);
@@ -3148,6 +3358,7 @@ mod tests {
             id: 7,
             input: "inspect".into(),
             access: AgentAccess::ReadOnly,
+            user: AgentUser::Current,
             model: Some("opus".into()),
             effort: ReasoningEffort::Default,
             output: AgentOutput::Final,
@@ -3205,6 +3416,7 @@ mod tests {
             id: 7,
             input: "inspect".into(),
             access: AgentAccess::ReadOnly,
+            user: AgentUser::Current,
             model: Some("opus".into()),
             effort: ReasoningEffort::Default,
             output: AgentOutput::Final,
@@ -3234,6 +3446,7 @@ mod tests {
             id: 8,
             input: "inspect".into(),
             access: AgentAccess::ReadOnly,
+            user: AgentUser::Current,
             model: Some("luna".into()),
             effort: ReasoningEffort::Default,
             output: AgentOutput::Final,
@@ -3290,6 +3503,7 @@ mod tests {
             id: 1,
             input: "Update the README".into(),
             access: AgentAccess::ReadWrite,
+            user: AgentUser::Current,
             model: Some("opus".into()),
             effort: ReasoningEffort::Default,
             output: AgentOutput::Live,
@@ -3326,6 +3540,7 @@ mod tests {
             id: 1,
             input: "Inspect this".into(),
             access: AgentAccess::ReadOnly,
+            user: AgentUser::Current,
             model: Some("opus".into()),
             effort: ReasoningEffort::Default,
             output: AgentOutput::Final,
@@ -3369,6 +3584,7 @@ mod tests {
             id: 1,
             input: "Inspect this".into(),
             access: AgentAccess::ReadOnly,
+            user: AgentUser::Current,
             model: Some("luna".into()),
             effort: ReasoningEffort::Default,
             output: AgentOutput::Final,
@@ -3527,6 +3743,7 @@ mod tests {
             id: 1,
             input: "Inspect the parser".into(),
             access: AgentAccess::ReadOnly,
+            user: AgentUser::Current,
             model: Some("opus".into()),
             effort: ReasoningEffort::Default,
             output: AgentOutput::Final,
@@ -3550,6 +3767,7 @@ mod tests {
             id: 2,
             input: "Check the tests".into(),
             access: AgentAccess::ReadOnly,
+            user: AgentUser::Current,
             model: Some("luna".into()),
             effort: ReasoningEffort::Default,
             output: AgentOutput::Final,
@@ -3590,6 +3808,7 @@ mod tests {
             id: 3,
             input: "Inspect this".into(),
             access: AgentAccess::ReadOnly,
+            user: AgentUser::Current,
             model: Some("opus".into()),
             effort: ReasoningEffort::ExtraHigh,
             output: AgentOutput::Final,
@@ -3652,6 +3871,7 @@ mod tests {
             id: 3,
             input: "inspect".into(),
             access: AgentAccess::ReadOnly,
+            user: AgentUser::Current,
             model: Some("codex".into()),
             effort: ReasoningEffort::Default,
             output: AgentOutput::Final,
@@ -3684,6 +3904,7 @@ mod tests {
             id: 4,
             input: "edit".into(),
             access: AgentAccess::ReadWrite,
+            user: AgentUser::Current,
             model: Some("opus".into()),
             effort: ReasoningEffort::Default,
             output: AgentOutput::Final,
@@ -3728,6 +3949,7 @@ mod tests {
             id: 1,
             input: "first".into(),
             access: AgentAccess::ReadOnly,
+            user: AgentUser::Current,
             model: Some("sol".into()),
             effort: ReasoningEffort::Default,
             output: AgentOutput::Final,
@@ -3737,6 +3959,7 @@ mod tests {
             id: 2,
             input: "second".into(),
             access: AgentAccess::ReadWrite,
+            user: AgentUser::Current,
             model: Some("opus".into()),
             effort: ReasoningEffort::Default,
             output: AgentOutput::Final,
@@ -3780,6 +4003,7 @@ mod tests {
             id: 3,
             input: "inspect".into(),
             access: AgentAccess::ReadOnly,
+            user: AgentUser::Current,
             model: Some("codex".into()),
             effort: ReasoningEffort::Default,
             output: AgentOutput::Final,
@@ -3815,6 +4039,7 @@ mod tests {
             id: 2,
             input: "inspect".into(),
             access: AgentAccess::ReadOnly,
+            user: AgentUser::Current,
             model: Some("sol".into()),
             effort: ReasoningEffort::Default,
             output: AgentOutput::Final,
@@ -3865,6 +4090,7 @@ mod tests {
                 id,
                 input: "inspect".into(),
                 access: AgentAccess::ReadOnly,
+                user: AgentUser::Current,
                 model: Some("sol".into()),
                 effort: ReasoningEffort::Default,
                 output: AgentOutput::Final,
@@ -3914,6 +4140,7 @@ mod tests {
             id: 2,
             input: "inspect".into(),
             access: AgentAccess::ReadOnly,
+            user: AgentUser::Current,
             model: Some("sol".into()),
             effort: ReasoningEffort::Default,
             output: AgentOutput::Final,
