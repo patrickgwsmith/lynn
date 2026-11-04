@@ -293,9 +293,22 @@ fn expanded_agent_results(session: &mut Session) -> Vec<String> {
 }
 
 fn pending_agent_statuses(session: &Session, workers: &Workers, color: bool) -> Vec<String> {
+    pending_agent_statuses_with_width(session, workers, color, terminal::columns())
+}
+
+/// Status lines for pending agents and loads. Expanded detail shows every
+/// pending request's full prompt; compact detail shows the running mutating
+/// request's prompt cut to one line, so you can tell what `opus!#28: …` is doing.
+fn pending_agent_statuses_with_width(
+    session: &Session,
+    workers: &Workers,
+    color: bool,
+    columns: usize,
+) -> Vec<String> {
     let mut statuses = Vec::new();
     for (&id, status) in &workers.pending_agents {
-        if session.detail == DisplayDetail::Expanded {
+        let expanded = session.detail == DisplayDetail::Expanded;
+        if expanded || workers.running_writer == Some(id) {
             if let Some(label) = agent_label_by_id(session, id) {
                 if let Some(input) = session.events.iter().find_map(|event| match event {
                     Event::AgentRequest {
@@ -305,7 +318,17 @@ fn pending_agent_statuses(session: &Session, workers: &Workers, color: bool) -> 
                     } if *request_id == id => Some(input),
                     _ => None,
                 }) {
-                    statuses.push(emphasize_prompt(&format!("{label} prompt: {input}"), color));
+                    let prefix = format!("{label} prompt: ");
+                    let input = if expanded {
+                        input.clone()
+                    } else {
+                        // Leave the last column free so the line never wraps.
+                        let room = columns
+                            .saturating_sub(1)
+                            .saturating_sub(display_width(&prefix));
+                        one_line_prompt(input, room)
+                    };
+                    statuses.push(emphasize_prompt(&format!("{prefix}{input}"), color));
                 }
             }
         }
@@ -313,6 +336,35 @@ fn pending_agent_statuses(session: &Session, workers: &Workers, color: bool) -> 
     }
     statuses.extend(workers.pending_http.values().cloned());
     statuses
+}
+
+fn display_width(text: &str) -> usize {
+    text.chars()
+        .map(|c| unicode_width::UnicodeWidthChar::width(c).unwrap_or(0))
+        .sum()
+}
+
+/// The first non-blank line of a prompt, cut to `room` columns. Ends with `…`
+/// when anything was left out, including later lines.
+fn one_line_prompt(input: &str, room: usize) -> String {
+    let mut lines = input.lines().map(str::trim).filter(|line| !line.is_empty());
+    let first = lines.next().unwrap_or("");
+    let more = lines.next().is_some();
+    if !more && display_width(first) <= room {
+        return first.to_owned();
+    }
+    let budget = room.saturating_sub(1);
+    let mut cut = String::new();
+    let mut used = 0;
+    for c in first.chars() {
+        let width = unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
+        if used + width > budget {
+            break;
+        }
+        used += width;
+        cut.push(c);
+    }
+    format!("{}…", cut.trim_end())
 }
 
 fn highlight_answer(text: &str) -> String {
@@ -3065,6 +3117,58 @@ mod tests {
             super::pending_agent_statuses(&session, &workers, false),
             ["opus?!#4: Read: src/main.rs",]
         );
+    }
+
+    #[test]
+    fn compact_status_shows_running_writer_prompt_on_one_line() {
+        let mut session = Session::new().unwrap();
+        let mut workers = Workers::new(false);
+        for (id, input, access) in [
+            (
+                4,
+                "Implement cancellation\nPreserve existing labels",
+                AgentAccess::ReadWrite,
+            ),
+            (5, "Update the tests", AgentAccess::ReadWrite),
+            (6, "Explain the queue", AgentAccess::ReadOnly),
+        ] {
+            session.events.push(Event::AgentRequest {
+                id,
+                input: input.into(),
+                access,
+                user: AgentUser::Current,
+                model: Some("opus".into()),
+                effort: ReasoningEffort::Default,
+                output: AgentOutput::Final,
+                pi_model: None,
+            });
+        }
+        workers.running_writer = Some(4);
+        workers
+            .pending_agents
+            .insert(4, "opus!#4: Edit: src/main.rs".into());
+        workers
+            .pending_agents
+            .insert(5, "opus!#5: waiting for opus!#4".into());
+        workers.pending_agents.insert(6, "opus?#6: …".into());
+        // Only the running `!` request gets a prompt line; later lines become `…`.
+        assert_eq!(
+            super::pending_agent_statuses_with_width(&session, &workers, false, 80),
+            [
+                "opus!#4 prompt: Implement cancellation…",
+                "opus!#4: Edit: src/main.rs",
+                "opus!#5: waiting for opus!#4",
+                "opus?#6: …",
+            ]
+        );
+        // A long first line is cut so the prompt never wraps.
+        assert_eq!(
+            super::pending_agent_statuses_with_width(&session, &workers, false, 30)[0],
+            "opus!#4 prompt: Implement ca…"
+        );
+        assert_eq!(super::one_line_prompt("  \n short ", 10), "short");
+        assert_eq!(super::one_line_prompt("exactly", 7), "exactly");
+        assert_eq!(super::one_line_prompt("exactly!", 7), "exactl…");
     }
 
     #[test]
