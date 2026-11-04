@@ -267,6 +267,31 @@ fn run_with(
     Err("fm did not provide a final answer".into())
 }
 
+/// Shortens a request to one line of at most `limit` characters, for the
+/// status line of a long-running `!` request.
+pub fn summarize_prompt(input: &str, limit: usize) -> Result<String, String> {
+    let answer = respond_text(&prompt_summary_prompt(input, limit))?;
+    clean_prompt_summary(&answer).ok_or_else(|| "fm returned no summary".into())
+}
+
+fn prompt_summary_prompt(input: &str, limit: usize) -> String {
+    format!(
+        "Rewrite this request as one short phrase of at most {limit} characters that says what it asks for. Keep names, file paths and #numbers. Reply with only the phrase, without quotes.\n\nRequest:\n{input}"
+    )
+}
+
+fn clean_prompt_summary(answer: &str) -> Option<String> {
+    let line = answer
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())?;
+    let line = line
+        .trim_matches(|c| matches!(c, '"' | '\'' | '`' | '“' | '”'))
+        .trim_end_matches('.')
+        .trim();
+    (!line.is_empty()).then(|| line.to_owned())
+}
+
 fn respond_text(prompt: &str) -> Result<String, String> {
     let output = Command::new("/usr/bin/fm")
         .args(["respond", "--no-stream", prompt])
@@ -485,6 +510,16 @@ mod tests {
         .unwrap();
         assert_eq!(answer, "insufficient evidence");
         assert_eq!(steps, MAX_STEPS);
+    }
+
+    #[test]
+    fn prompt_summaries_are_one_clean_line() {
+        assert_eq!(
+            super::clean_prompt_summary("\n  \"Show the running prompt.\"\nMore text"),
+            Some("Show the running prompt".into())
+        );
+        assert_eq!(super::clean_prompt_summary("  \n \"\" "), None);
+        assert!(super::prompt_summary_prompt("fix it", 42).contains("at most 42 characters"));
     }
 
     #[test]

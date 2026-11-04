@@ -298,8 +298,10 @@ fn pending_agent_statuses(session: &Session, workers: &Workers, color: bool) -> 
 }
 
 /// Status lines for pending agents and loads. Expanded detail shows every
-/// pending request's full prompt; compact detail shows the running mutating
-/// request's prompt cut to one line, so you can tell what `opus!#28: …` is doing.
+/// pending request's full prompt, never fm's summary. Compact detail shows a
+/// `!` request's prompt on one line, running or queued, once it has been
+/// pending for [`PROMPT_REVEAL_DELAY`], using fm's summary when there is one,
+/// so you can tell what `opus!#28: …` is doing when you come back to it.
 fn pending_agent_statuses_with_width(
     session: &Session,
     workers: &Workers,
@@ -309,25 +311,21 @@ fn pending_agent_statuses_with_width(
     let mut statuses = Vec::new();
     for (&id, status) in &workers.pending_agents {
         let expanded = session.detail == DisplayDetail::Expanded;
-        if expanded || workers.running_writer == Some(id) {
+        let pending_prompt = workers
+            .pending_prompts
+            .get(&id)
+            .filter(|prompt| prompt.shown);
+        if expanded || pending_prompt.is_some() {
             if let Some(label) = agent_label_by_id(session, id) {
-                if let Some(input) = session.events.iter().find_map(|event| match event {
-                    Event::AgentRequest {
-                        id: request_id,
-                        input,
-                        ..
-                    } if *request_id == id => Some(input),
-                    _ => None,
-                }) {
+                if let Some(input) = request_input(session, id) {
                     let prefix = format!("{label} prompt: ");
                     let input = if expanded {
-                        input.clone()
+                        input.to_owned()
                     } else {
-                        // Leave the last column free so the line never wraps.
-                        let room = columns
-                            .saturating_sub(1)
-                            .saturating_sub(display_width(&prefix));
-                        one_line_prompt(input, room)
+                        let text = pending_prompt
+                            .and_then(|prompt| prompt.summary.as_deref())
+                            .unwrap_or(input);
+                        one_line_prompt(text, prompt_room(&prefix, columns))
                     };
                     statuses.push(emphasize_prompt(&format!("{prefix}{input}"), color));
                 }
@@ -337,6 +335,32 @@ fn pending_agent_statuses_with_width(
     }
     statuses.extend(workers.pending_http.values().cloned());
     statuses
+}
+
+fn request_input(session: &Session, id: usize) -> Option<&str> {
+    session.events.iter().find_map(|event| match event {
+        Event::AgentRequest {
+            id: request_id,
+            input,
+            ..
+        } if *request_id == id => Some(input.as_str()),
+        _ => None,
+    })
+}
+
+/// Columns left for a prompt after `prefix`, keeping the last column free so
+/// the line never wraps.
+fn prompt_room(prefix: &str, columns: usize) -> usize {
+    columns
+        .saturating_sub(1)
+        .saturating_sub(display_width(prefix))
+}
+
+/// Whether a prompt already fits on one line of `room` columns, so needs no summary.
+fn prompt_fits(input: &str, room: usize) -> bool {
+    let mut lines = input.lines().map(str::trim).filter(|line| !line.is_empty());
+    let first = lines.next().unwrap_or("");
+    lines.next().is_none() && display_width(first) <= room
 }
 
 fn display_width(text: &str) -> usize {
@@ -448,8 +472,34 @@ enum HttpResult {
 
 enum WorkerUpdate {
     Agent(AgentUpdate),
-    AgentProgress { id: usize, status: String },
+    AgentProgress {
+        id: usize,
+        status: String,
+    },
+    /// fm's one-line summary of a running or queued `!` request's prompt.
+    PromptSummary {
+        id: usize,
+        summary: String,
+    },
+    /// A `!` request has been pending long enough to show its prompt.
+    PromptReveal {
+        id: usize,
+    },
     Http(HttpUpdate),
+}
+
+/// How long a `!` request is pending, queued or running, before its prompt
+/// appears above its status.
+/// fm usually summarizes a prompt in about a second, so the summary is
+/// normally ready by then.
+const PROMPT_REVEAL_DELAY: Duration = Duration::from_secs(5);
+
+/// The prompt line for a running or queued `!` request, shown once it has
+/// been pending for [`PROMPT_REVEAL_DELAY`].
+#[derive(Default)]
+struct PendingPrompt {
+    summary: Option<String>,
+    shown: bool,
 }
 
 struct LiveUpdate {
@@ -467,6 +517,8 @@ struct Workers {
     next_agent_id: usize,
     active_agents: usize,
     running_writer: Option<usize>,
+    /// Prompt lines for running and queued `!` requests, by request id.
+    pending_prompts: BTreeMap<usize, PendingPrompt>,
     write_gate: Arc<Mutex<()>>,
     pending_agents: BTreeMap<usize, String>,
     pending_http: BTreeMap<usize, String>,
@@ -531,6 +583,7 @@ impl Workers {
             next_agent_id: 1,
             active_agents: 0,
             running_writer: None,
+            pending_prompts: BTreeMap::new(),
             write_gate: Arc::new(Mutex::new(())),
             pending_agents: BTreeMap::new(),
             pending_http: BTreeMap::new(),
@@ -1421,6 +1474,7 @@ fn start_agents(request: AgentTask<'_>, session: &mut Session, workers: &mut Wor
             (_, Some(predecessor)) => {
                 let status = queued_behind_status(&request, predecessor, session);
                 workers.pending_agents.insert(id, status.clone());
+                start_pending_prompt(&request, session, workers);
                 workers.queued_agents.insert(id, request);
                 status
             }
@@ -1432,6 +1486,9 @@ fn start_agents(request: AgentTask<'_>, session: &mut Session, workers: &mut Wor
                     .join(", ");
                 let status = format!("{label}: waiting for {waiting_for}");
                 workers.pending_agents.insert(id, status.clone());
+                if request.options.access == AgentAccess::ReadWrite {
+                    start_pending_prompt(&request, session, workers);
+                }
                 workers.queued_agents.insert(id, request);
                 status
             }
@@ -1504,6 +1561,10 @@ fn launch_agent(
     if request.options.access == AgentAccess::ReadWrite {
         debug_assert!(mutating_predecessor(&request, workers).is_none());
         workers.running_writer = Some(request.id);
+        // A request that waited in the queue keeps its timer and summary.
+        if !workers.pending_prompts.contains_key(&request.id) {
+            start_pending_prompt(&request, session, workers);
+        }
     }
     let context = agent_context(session, &request, &references);
     workers
@@ -1553,6 +1614,41 @@ fn launch_agent(
             result,
             elapsed: started.elapsed(),
         }));
+    });
+}
+
+/// Starts the timer that reveals a `!` request's prompt, from when it is
+/// queued or, if it never waited, launched. When the prompt won't fit on one
+/// line, fm shortens it at the same time so the summary is usually ready when
+/// the line appears. Until it is, the prompt's first line is shown cut to fit.
+fn start_pending_prompt(request: &QueuedAgent, session: &Session, workers: &mut Workers) {
+    workers
+        .pending_prompts
+        .insert(request.id, PendingPrompt::default());
+    // Status lines are only drawn at an interactive prompt.
+    if !workers.interactive {
+        return;
+    }
+    let id = request.id;
+    let input = request_input(session, id)
+        .unwrap_or(&request.task)
+        .to_owned();
+    let room = prompt_room(
+        &format!("{} prompt: ", request.label()),
+        terminal::columns(),
+    );
+    if !prompt_fits(&input, room) && room > 0 {
+        let tx = workers.worker_tx.clone();
+        std::thread::spawn(move || {
+            if let Ok(summary) = fm::summarize_prompt(&input, room) {
+                let _ = tx.send(WorkerUpdate::PromptSummary { id, summary });
+            }
+        });
+    }
+    let tx = workers.worker_tx.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(PROMPT_REVEAL_DELAY);
+        let _ = tx.send(WorkerUpdate::PromptReveal { id });
     });
 }
 
@@ -2641,6 +2737,18 @@ fn format_worker_update(
             }
             None
         }
+        WorkerUpdate::PromptSummary { id, summary } => {
+            if let Some(prompt) = workers.pending_prompts.get_mut(&id) {
+                prompt.summary = Some(summary);
+            }
+            None
+        }
+        WorkerUpdate::PromptReveal { id } => {
+            if let Some(prompt) = workers.pending_prompts.get_mut(&id) {
+                prompt.shown = true;
+            }
+            None
+        }
         WorkerUpdate::Http(update) => {
             workers.active_http = workers.active_http.saturating_sub(1);
             workers.loading_urls.retain(|_, id| *id != update.id);
@@ -2725,6 +2833,7 @@ fn format_worker_update(
 fn format_update(update: AgentUpdate, session: &mut Session, workers: &mut Workers) -> String {
     workers.active_agents = workers.active_agents.saturating_sub(1);
     workers.pending_agents.remove(&update.id);
+    workers.pending_prompts.remove(&update.id);
     if workers.running_writer == Some(update.id) {
         workers.running_writer = None;
     }
@@ -3107,7 +3216,7 @@ mod tests {
     }
 
     #[test]
-    fn compact_status_shows_running_writer_prompt_on_one_line() {
+    fn compact_status_shows_pending_writer_prompts_on_one_line() {
         let mut session = Session::new().unwrap();
         let mut workers = Workers::new(false);
         for (id, input, access) in [
@@ -3138,7 +3247,41 @@ mod tests {
             .pending_agents
             .insert(5, "opus!#5: waiting for opus!#4".into());
         workers.pending_agents.insert(6, "opus?#6: …".into());
-        // Only the running `!` request gets a prompt line; later lines become `…`.
+        // Before the reveal delay, no prompt line is shown.
+        workers.pending_prompts.insert(4, Default::default());
+        assert_eq!(
+            super::pending_agent_statuses_with_width(&session, &workers, false, 80)[0],
+            "opus!#4: Edit: src/main.rs"
+        );
+        // A summary arriving early still waits for the delay.
+        super::format_worker_update(
+            super::WorkerUpdate::PromptSummary {
+                id: 4,
+                summary: "Add cancellation, keep labels".into(),
+            },
+            &mut session,
+            &mut workers,
+        );
+        assert_eq!(
+            super::pending_agent_statuses_with_width(&session, &workers, false, 80).len(),
+            3
+        );
+        let summary = workers.pending_prompts.get_mut(&4).unwrap().summary.take();
+        assert_eq!(summary.as_deref(), Some("Add cancellation, keep labels"));
+        // Updates for another request are ignored.
+        super::format_worker_update(
+            super::WorkerUpdate::PromptReveal { id: 6 },
+            &mut session,
+            &mut workers,
+        );
+        assert!(!workers.pending_prompts[&4].shown);
+        super::format_worker_update(
+            super::WorkerUpdate::PromptReveal { id: 4 },
+            &mut session,
+            &mut workers,
+        );
+        // Without a summary yet, the prompt line comes from the first line;
+        // later lines become `…`. Requests not yet revealed get none.
         assert_eq!(
             super::pending_agent_statuses_with_width(&session, &workers, false, 80),
             [
@@ -3153,6 +3296,61 @@ mod tests {
             super::pending_agent_statuses_with_width(&session, &workers, false, 30)[0],
             "opus!#4 prompt: Implement ca…"
         );
+        // Once fm's summary arrives it replaces the first line, still cut to fit.
+        workers.pending_prompts.get_mut(&4).unwrap().summary = summary;
+        assert_eq!(
+            super::pending_agent_statuses_with_width(&session, &workers, false, 80)[0],
+            "opus!#4 prompt: Add cancellation, keep labels"
+        );
+        // A queued `!` request gets its own prompt line once revealed, but a
+        // `?` request never does.
+        workers.pending_prompts.insert(5, Default::default());
+        super::format_worker_update(
+            super::WorkerUpdate::PromptReveal { id: 5 },
+            &mut session,
+            &mut workers,
+        );
+        assert_eq!(
+            super::pending_agent_statuses_with_width(&session, &workers, false, 80),
+            [
+                "opus!#4 prompt: Add cancellation, keep labels",
+                "opus!#4: Edit: src/main.rs",
+                "opus!#5 prompt: Update the tests",
+                "opus!#5: waiting for opus!#4",
+                "opus?#6: …",
+            ]
+        );
+        // Expanded detail (↓ on an empty line) shows every full prompt, not
+        // fm's summary.
+        session.detail = DisplayDetail::Expanded;
+        assert_eq!(
+            super::pending_agent_statuses_with_width(&session, &workers, false, 30)[..2],
+            [
+                "opus!#4 prompt: Implement cancellation\nPreserve existing labels",
+                "opus!#4: Edit: src/main.rs",
+            ]
+        );
+        session.detail = DisplayDetail::Compact;
+        assert_eq!(
+            super::pending_agent_statuses_with_width(&session, &workers, false, 30)[0],
+            "opus!#4 prompt: Add cancella…"
+        );
+        // Finishing a request drops its prompt line.
+        super::format_update(
+            super::AgentUpdate {
+                id: 4,
+                model: "opus".into(),
+                access: AgentAccess::ReadWrite,
+                result: Err("stopped".into()),
+                elapsed: Duration::ZERO,
+            },
+            &mut session,
+            &mut workers,
+        );
+        assert!(!workers.pending_prompts.contains_key(&4));
+        assert!(super::prompt_fits("  one line  ", 8));
+        assert!(!super::prompt_fits("one\ntwo", 80));
+        assert!(!super::prompt_fits("too long", 7));
         assert_eq!(super::one_line_prompt("  \n short ", 10), "short");
         assert_eq!(super::one_line_prompt("exactly", 7), "exactly");
         assert_eq!(super::one_line_prompt("exactly!", 7), "exactl…");
