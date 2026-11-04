@@ -287,7 +287,7 @@ Put `+` before `bash?`, `zsh?`, `HEAD`, or `FEED` to watch a command or URL:
 ```
 
 - Lynn runs each watch once when registered and again only when you enter `+` or `+-`. Shell watches run as `staffer`; HEAD and feed watches use Lynn's HTTP client.
-- `+ URL` accepts Atom and RSS feeds when their responses have `Content-Type: application/atom+xml` or `application/rss+xml`. Use `+ FEED URL` to parse a feed served with a generic XML content type, such as the crates.io RSS feed. Feed entries show their title and link; `+` shows new entries and `+-` also shows entries that disappeared from the feed.
+- `+ URL` accepts Atom and RSS feeds when their responses have `Content-Type: application/atom+xml` or `application/rss+xml`. Use `+ FEED URL` to parse a feed served with a generic XML content type, such as the crates.io RSS feed. Feed entries show their title and link, plus the entry's own post when an Atom feed gives a different `rel="related"` link (as link blogs like Daring Fireball do): `title — link (post: permalink)`; `+` shows new entries and `+-` also shows entries that disappeared from the feed.
 - Agents can see watch output in the shared session.
 - Shell watches retain up to 4,000 lines or 1 MiB for display and `#n` recall. Longer results keep the beginning and end, with an omission marker in the middle. To keep agent requests manageable, Lynn includes up to 16 KiB per watch and 64 KiB total automatically, or up to 128 KiB when you refer to a watch with `#n` or `#n.r`; these excerpts also keep the beginning and end.
 - Shell watches need passwordless `sudo` for `staffer`. Errors show at the prompt.

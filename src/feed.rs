@@ -9,6 +9,8 @@ struct Entry {
     id: String,
     title: String,
     link: String,
+    /// Atom `rel="related"` link, such as a link blog's own post about the linked article.
+    related: String,
 }
 
 #[derive(Clone, Copy)]
@@ -111,9 +113,11 @@ pub fn render(resource: &Resource) -> Result<String, String> {
                             _ => {}
                         }
                     }
-                    if rel.as_deref().is_none_or(|value| value == "alternate") {
-                        if let (Some(entry), Some(href)) = (&mut current, href) {
-                            entry.link = href;
+                    if let (Some(entry), Some(href)) = (&mut current, href) {
+                        match rel.as_deref() {
+                            None | Some("alternate") => entry.link = href,
+                            Some("related") if entry.related.is_empty() => entry.related = href,
+                            _ => {}
                         }
                     }
                 }
@@ -145,11 +149,15 @@ pub fn render(resource: &Resource) -> Result<String, String> {
                         } else {
                             ""
                         };
-                        entries.push(if link.is_empty() {
-                            title
-                        } else {
-                            format!("{title} — {link}")
-                        });
+                        let related = entry.related.trim();
+                        entries.push(
+                            match (link.is_empty(), related.is_empty() || related == link) {
+                                (true, true) => title,
+                                (true, false) => format!("{title} — {related}"),
+                                (false, true) => format!("{title} — {link}"),
+                                (false, false) => format!("{title} — {link} (post: {related})"),
+                            },
+                        );
                     }
                 }
                 path.pop();
@@ -261,6 +269,20 @@ mod tests {
                 DiffMode::AddedAndRemoved
             ),
             "-Fix & test — https://example.com/1"
+        );
+    }
+
+    #[test]
+    fn atom_related_link_is_shown_as_the_post() {
+        let resource = Resource {
+            body_url: "https://daringfireball.net/feeds/main".into(),
+            redirect_targets: Default::default(),
+            content_type: "application/atom+xml".into(),
+            content: r#"<?xml version="1.0"?><feed xmlns="http://www.w3.org/2005/Atom"><entry><title>Linked</title><link rel="alternate" type="text/html" href="https://example.com/article"/><link rel="shorturl" href="http://df4.us/x"/><link rel="related" type="text/html" href="https://daringfireball.net/linked/1"/><id>tag:df,1</id></entry><entry><title>Same</title><link rel="related" href="https://daringfireball.net/2"/><link rel="alternate" href="https://daringfireball.net/2"/><id>tag:df,2</id></entry><entry><title>Article</title><link rel="alternate" href="https://daringfireball.net/3"/><id>tag:df,3</id></entry></feed>"#.into(),
+        };
+        assert_eq!(
+            render(&resource).unwrap(),
+            "Linked — https://example.com/article (post: https://daringfireball.net/linked/1)\nSame — https://daringfireball.net/2\nArticle — https://daringfireball.net/3"
         );
     }
 
