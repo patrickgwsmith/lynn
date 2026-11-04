@@ -15,6 +15,8 @@ lynn
 
 Both the package and executable are named `lynn`.
 
+You can set `lynn` as your terminal's startup command. When no shell started Lynn (`SHLVL` is unset), Lynn loads `PATH` from your login shell (`$SHELL -l -i`) so it can find agent CLIs such as `claude` and `codex`.
+
 ## Why use Lynn
 
 A coding agent can usually change all the files in your project. Lynn gives you more control:

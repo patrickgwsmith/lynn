@@ -10,6 +10,7 @@ mod http;
 mod inline;
 mod jsc;
 mod live;
+mod login_path;
 mod pi;
 mod session;
 mod shell;
@@ -557,6 +558,7 @@ fn main() {
         print_help();
         return;
     }
+    login_path::load_if_started_without_shell();
     let mut session = match Session::new() {
         Ok(session) => session,
         Err(error) => {
