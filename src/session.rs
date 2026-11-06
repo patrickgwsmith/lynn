@@ -289,6 +289,8 @@ pub enum Event {
         output: AgentOutput,
         /// The Pi model the request ran with, from `pi.<model>?`.
         pi_model: Option<String>,
+        /// When the request was sent, for showing how long ago in expanded detail.
+        sent_at: Instant,
     },
     AgentResponse {
         id: usize,

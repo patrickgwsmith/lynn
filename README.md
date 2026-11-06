@@ -359,7 +359,7 @@ The prompt shows a short form of the current directory. It shows the first chara
 
 In an interactive terminal, Lynn sets the terminal title to the same shortened directory path shown in the prompt and updates it after `cd` or a child command changes the title.
 
-Press Down at an empty prompt to show its full path until you enter a command or press Ctrl-C. The next prompt uses the short path again. Lynn also reprints completed agent results with the request that produced each one. New results stay compact; press Down again to expand those results.
+Press Down at an empty prompt to show its full path until you enter a command or press Ctrl-C. The next prompt uses the short path again. Lynn also reprints completed agent results with the request that produced each one and how long ago it was sent, such as `opus!#3 prompt [18m ago]: …`; prompts of running and queued requests show the same age. New results stay compact; press Down again to expand those results.
 
 Colors help you see the access level before you press Enter:
 

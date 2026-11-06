@@ -247,14 +247,36 @@ fn render_session_agent(
     if prompt == PromptLine::WhenExpanded && !session.expanded_response_ids.contains(&label.id) {
         return result;
     }
-    let Some(input) = session.events.iter().find_map(|event| match event {
-        Event::AgentRequest { id, input, .. } if *id == label.id => Some(input),
+    let Some((input, sent_at)) = session.events.iter().find_map(|event| match event {
+        Event::AgentRequest {
+            id, input, sent_at, ..
+        } if *id == label.id => Some((input, *sent_at)),
         _ => None,
     }) else {
         return result;
     };
-    let prompt = format!("{label} prompt: {input}");
+    let prompt = format!(
+        "{}{input}",
+        expanded_prompt_prefix(&label, sent_at.elapsed())
+    );
     format!("{}\n{result}", emphasize_prompt(&prompt, output_color()))
+}
+
+/// The start of a full prompt line, such as `opus!#3 prompt [18m ago]: `.
+fn expanded_prompt_prefix(label: &dyn std::fmt::Display, age: Duration) -> String {
+    format!("{label} prompt [{}]: ", format_ago(age))
+}
+
+/// How long ago something happened, such as `just now`, `18m ago`,
+/// `2h 05m ago` or `3d ago`.
+fn format_ago(age: Duration) -> String {
+    let minutes = age.as_secs() / 60;
+    match minutes {
+        0 => "just now".to_owned(),
+        1..60 => format!("{minutes}m ago"),
+        60..1440 => format!("{}h {:02}m ago", minutes / 60, minutes % 60),
+        _ => format!("{}d ago", minutes / 1440),
+    }
 }
 
 fn emphasize_prompt(prompt: &str, color: bool) -> String {
@@ -331,7 +353,11 @@ fn pending_agent_statuses_with_width(
         if expanded || pending_prompt.is_some() {
             if let Some(label) = agent_label_by_id(session, id) {
                 if let Some(input) = request_input(session, id) {
-                    let prefix = format!("{label} prompt: ");
+                    let sent_at = request_sent_at(session, id).filter(|_| expanded);
+                    let prefix = match sent_at {
+                        Some(sent_at) => expanded_prompt_prefix(&label, sent_at.elapsed()),
+                        None => format!("{label} prompt: "),
+                    };
                     let input = if expanded {
                         input.to_owned()
                     } else {
@@ -357,6 +383,17 @@ fn request_input(session: &Session, id: usize) -> Option<&str> {
             input,
             ..
         } if *request_id == id => Some(input.as_str()),
+        _ => None,
+    })
+}
+
+fn request_sent_at(session: &Session, id: usize) -> Option<Instant> {
+    session.events.iter().find_map(|event| match event {
+        Event::AgentRequest {
+            id: request_id,
+            sent_at,
+            ..
+        } if *request_id == id => Some(*sent_at),
         _ => None,
     })
 }
@@ -1351,6 +1388,7 @@ fn resolve_inline(
                 ));
                 context.push_str(&references.text);
                 session.events.push(Event::AgentRequest {
+                    sent_at: Instant::now(),
                     id,
                     input: task.to_owned(),
                     access: AgentAccess::ReadOnly,
@@ -1460,6 +1498,7 @@ fn start_agents(request: AgentTask<'_>, session: &mut Session, workers: &mut Wor
             .then(|| session.pi_model.clone())
             .flatten();
         session.events.push(Event::AgentRequest {
+            sent_at: Instant::now(),
             id,
             input: task.into(),
             access: options.access,
@@ -2948,7 +2987,7 @@ mod tests {
     };
     use crate::terminal::Terminal;
     use std::path::Path;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn conversation_context_retains_early_instructions_and_large_replies() {
@@ -2957,6 +2996,7 @@ mod tests {
             "Always preserve the existing CLI syntax".into(),
         ));
         session.events.push(Event::AgentRequest {
+            sent_at: Instant::now(),
             id: 1,
             input: "Keep mutating agents serial across all models".into(),
             access: AgentAccess::ReadWrite,
@@ -3148,6 +3188,7 @@ mod tests {
             (5, "sol", "Update the tests", "sol!#5: waiting for opus!#4"),
         ] {
             session.events.push(Event::AgentRequest {
+                sent_at: Instant::now(),
                 id,
                 input: input.into(),
                 access: AgentAccess::ReadWrite,
@@ -3168,9 +3209,9 @@ mod tests {
         assert_eq!(
             super::pending_agent_statuses(&session, &workers, false),
             [
-                "opus!#4 prompt: Implement cancellation",
+                "opus!#4 prompt [just now]: Implement cancellation",
                 "opus!#4: …",
-                "sol!#5 prompt: Update the tests",
+                "sol!#5 prompt [just now]: Update the tests",
                 "sol!#5: waiting for opus!#4",
             ]
         );
@@ -3180,7 +3221,7 @@ mod tests {
         assert_eq!(
             &super::pending_agent_statuses(&session, &workers, false)[..2],
             [
-                "opus!#4 prompt: Implement cancellation",
+                "opus!#4 prompt [just now]: Implement cancellation",
                 "opus!#4: Edit: src/main.rs",
             ]
         );
@@ -3188,7 +3229,7 @@ mod tests {
         assert_eq!(
             super::pending_agent_statuses(&session, &workers, false),
             [
-                "sol!#5 prompt: Update the tests",
+                "sol!#5 prompt [just now]: Update the tests",
                 "sol!#5: waiting for opus!#4",
             ]
         );
@@ -3201,6 +3242,7 @@ mod tests {
         let mut session = Session::new().unwrap();
         let mut workers = Workers::new(false);
         session.events.push(Event::AgentRequest {
+            sent_at: Instant::now(),
             id: 4,
             input: "Implement cancellation\nPreserve existing labels".into(),
             access: AgentAccess::ReadWrite,
@@ -3217,7 +3259,7 @@ mod tests {
         assert_eq!(
             super::pending_agent_statuses(&session, &workers, true),
             [
-                "\x1b[1mopus?!#4 prompt: Implement cancellation\nPreserve existing labels\x1b[0m",
+                "\x1b[1mopus?!#4 prompt [just now]: Implement cancellation\nPreserve existing labels\x1b[0m",
                 "opus?!#4: Read: src/main.rs",
             ]
         );
@@ -3242,6 +3284,7 @@ mod tests {
             (6, "Explain the queue", AgentAccess::ReadOnly),
         ] {
             session.events.push(Event::AgentRequest {
+                sent_at: Instant::now(),
                 id,
                 input: input.into(),
                 access,
@@ -3339,7 +3382,7 @@ mod tests {
         assert_eq!(
             super::pending_agent_statuses_with_width(&session, &workers, false, 30)[..2],
             [
-                "opus!#4 prompt: Implement cancellation\nPreserve existing labels",
+                "opus!#4 prompt [just now]: Implement cancellation\nPreserve existing labels",
                 "opus!#4: Edit: src/main.rs",
             ]
         );
@@ -3375,7 +3418,7 @@ mod tests {
         session.detail = DisplayDetail::Expanded;
         assert_eq!(
             super::pending_agent_statuses_with_width(&session, &workers, false, 80)[..2],
-            ["opus!#5 prompt: Update the tests", "opus!#5: …"]
+            ["opus!#5 prompt [just now]: Update the tests", "opus!#5: …"]
         );
         session.detail = DisplayDetail::Compact;
         assert!(super::prompt_fits("  one line  ", 8));
@@ -3395,6 +3438,7 @@ mod tests {
         workers.pending_agents.insert(1, "opus!#1: …".into());
         workers.active_agents = 1;
         session.events.push(Event::AgentRequest {
+            sent_at: Instant::now(),
             id: 1,
             input: "first change".into(),
             access: AgentAccess::ReadWrite,
@@ -3457,6 +3501,7 @@ mod tests {
         workers.active_agents = 1;
         for (id, user) in [(1, AgentUser::Current), (2, AgentUser::Staffer)] {
             session.events.push(Event::AgentRequest {
+                sent_at: Instant::now(),
                 id,
                 input: "inspect".into(),
                 access: AgentAccess::ReadOnly,
@@ -3502,6 +3547,7 @@ mod tests {
         workers.pending_agents.insert(1, "opus?#1: …".into());
         workers.active_agents = 1;
         session.events.push(Event::AgentRequest {
+            sent_at: Instant::now(),
             id: 1,
             input: "research".into(),
             access: AgentAccess::ReadOnly,
@@ -3543,6 +3589,7 @@ mod tests {
         workers.pending_agents.insert(1, "opus!#1: …".into());
         workers.active_agents = 1;
         session.events.push(Event::AgentRequest {
+            sent_at: Instant::now(),
             id: 1,
             input: "first change".into(),
             access: AgentAccess::ReadWrite,
@@ -3607,6 +3654,7 @@ mod tests {
         workers.pending_agents.insert(1, "opus!#1: …".into());
         workers.active_agents = 1;
         session.events.push(Event::AgentRequest {
+            sent_at: Instant::now(),
             id: 1,
             input: "first change".into(),
             access: AgentAccess::ReadWrite,
@@ -3674,6 +3722,7 @@ mod tests {
         let mut session = Session::new().unwrap();
         let mut workers = Workers::new(false);
         session.events.push(Event::AgentRequest {
+            sent_at: Instant::now(),
             id: 7,
             input: "inspect".into(),
             access: AgentAccess::ReadOnly,
@@ -3732,6 +3781,7 @@ mod tests {
         let mut session = Session::new().unwrap();
         let mut workers = Workers::new(false);
         session.events.push(Event::AgentRequest {
+            sent_at: Instant::now(),
             id: 7,
             input: "inspect".into(),
             access: AgentAccess::ReadOnly,
@@ -3762,6 +3812,7 @@ mod tests {
         assert!(workers.pending_agents.is_empty());
 
         session.events.push(Event::AgentRequest {
+            sent_at: Instant::now(),
             id: 8,
             input: "inspect".into(),
             access: AgentAccess::ReadOnly,
@@ -3819,6 +3870,7 @@ mod tests {
     fn streamed_result_keeps_selector_in_final_and_recall() {
         let mut session = Session::new().unwrap();
         session.events.push(Event::AgentRequest {
+            sent_at: Instant::now(),
             id: 1,
             input: "Update the README".into(),
             access: AgentAccess::ReadWrite,
@@ -3856,6 +3908,7 @@ mod tests {
     fn reported_model_is_shown_only_in_down_expansion() {
         let mut session = Session::new().unwrap();
         session.events.push(Event::AgentRequest {
+            sent_at: Instant::now(),
             id: 1,
             input: "Inspect this".into(),
             access: AgentAccess::ReadOnly,
@@ -3892,7 +3945,7 @@ mod tests {
         );
         assert_eq!(
             expanded_agent_results(&mut session),
-            ["opus?#1 prompt: Inspect this\nopus?#1 [used claude-fable-5-1; 0.0s]: Done"]
+            ["opus?#1 prompt [just now]: Inspect this\nopus?#1 [used claude-fable-5-1; 0.0s]: Done"]
         );
     }
 
@@ -3900,6 +3953,7 @@ mod tests {
     fn codex_requested_model_is_labeled_as_unverified_on_expansion() {
         let mut session = Session::new().unwrap();
         session.events.push(Event::AgentRequest {
+            sent_at: Instant::now(),
             id: 1,
             input: "Inspect this".into(),
             access: AgentAccess::ReadOnly,
@@ -3926,7 +3980,7 @@ mod tests {
         );
         assert_eq!(line, "luna?#1: Looks fine");
         assert_eq!(expanded_agent_results(&mut session),
-            ["luna?#1 prompt: Inspect this\nluna?#1 [requested gpt-6-luna; actual model unreported; 12.4s]: Looks fine"]);
+            ["luna?#1 prompt [just now]: Inspect this\nluna?#1 [requested gpt-6-luna; actual model unreported; 12.4s]: Looks fine"]);
     }
 
     #[test]
@@ -3934,6 +3988,15 @@ mod tests {
         assert_eq!(format_elapsed(Duration::from_millis(840)), "0.8s");
         assert_eq!(format_elapsed(Duration::from_millis(59_940)), "59.9s");
         assert_eq!(format_elapsed(Duration::from_secs(185)), "3m 05s");
+    }
+
+    #[test]
+    fn prompt_ages_use_minutes_then_hours_then_days() {
+        use super::format_ago;
+        assert_eq!(format_ago(Duration::from_secs(59)), "just now");
+        assert_eq!(format_ago(Duration::from_secs(18 * 60 + 40)), "18m ago");
+        assert_eq!(format_ago(Duration::from_secs(125 * 60)), "2h 05m ago");
+        assert_eq!(format_ago(Duration::from_secs(3 * 86_400 + 60)), "3d ago");
     }
 
     #[test]
@@ -4059,6 +4122,7 @@ mod tests {
     fn down_expands_existing_results_without_changing_future_updates() {
         let mut session = Session::new().unwrap();
         session.events.push(Event::AgentRequest {
+            sent_at: Instant::now(),
             id: 1,
             input: "Inspect the parser".into(),
             access: AgentAccess::ReadOnly,
@@ -4078,11 +4142,12 @@ mod tests {
         session.detail = DisplayDetail::Expanded;
         assert_eq!(
             expanded_agent_results(&mut session),
-            ["opus?#1 prompt: Inspect the parser\nopus?#1: Looks sound"]
+            ["opus?#1 prompt [just now]: Inspect the parser\nopus?#1: Looks sound"]
         );
         assert!(expanded_agent_results(&mut session).is_empty());
 
         session.events.push(Event::AgentRequest {
+            sent_at: Instant::now(),
             id: 2,
             input: "Check the tests".into(),
             access: AgentAccess::ReadOnly,
@@ -4116,7 +4181,7 @@ mod tests {
         );
         assert_eq!(
             expanded_agent_results(&mut session),
-            ["luna?#2 prompt: Check the tests\nluna?#2 [0.0s]: Tests pass"]
+            ["luna?#2 prompt [just now]: Check the tests\nluna?#2 [0.0s]: Tests pass"]
         );
     }
 
@@ -4124,6 +4189,7 @@ mod tests {
     fn reasoning_result_keeps_its_suffix_when_recalled() {
         let mut session = Session::new().unwrap();
         session.events.push(Event::AgentRequest {
+            sent_at: Instant::now(),
             id: 3,
             input: "Inspect this".into(),
             access: AgentAccess::ReadOnly,
@@ -4187,6 +4253,7 @@ mod tests {
         let mut session = Session::new().unwrap();
         let workers = Workers::new(false);
         session.events.push(Event::AgentRequest {
+            sent_at: Instant::now(),
             id: 3,
             input: "inspect".into(),
             access: AgentAccess::ReadOnly,
@@ -4220,6 +4287,7 @@ mod tests {
             "\nReferenced reply codex?#3:\nthe full\nmultiline finding\n"
         );
         session.events.push(Event::AgentRequest {
+            sent_at: Instant::now(),
             id: 4,
             input: "edit".into(),
             access: AgentAccess::ReadWrite,
@@ -4265,6 +4333,7 @@ mod tests {
         let mut session = Session::new().unwrap();
         assert_eq!(latest_agent_response(&session), None);
         session.events.push(Event::AgentRequest {
+            sent_at: Instant::now(),
             id: 1,
             input: "first".into(),
             access: AgentAccess::ReadOnly,
@@ -4275,6 +4344,7 @@ mod tests {
             pi_model: None,
         });
         session.events.push(Event::AgentRequest {
+            sent_at: Instant::now(),
             id: 2,
             input: "second".into(),
             access: AgentAccess::ReadWrite,
@@ -4319,6 +4389,7 @@ mod tests {
         let mut session = Session::new().unwrap();
         let mut workers = Workers::new(false);
         session.events.push(Event::AgentRequest {
+            sent_at: Instant::now(),
             id: 3,
             input: "inspect".into(),
             access: AgentAccess::ReadOnly,
@@ -4355,6 +4426,7 @@ mod tests {
         workers.active_agents = 1;
         workers.pending_agents.insert(2, "sol?#2: …".into());
         session.events.push(Event::AgentRequest {
+            sent_at: Instant::now(),
             id: 2,
             input: "inspect".into(),
             access: AgentAccess::ReadOnly,
@@ -4406,6 +4478,7 @@ mod tests {
         let mut workers = Workers::new(false);
         for id in [1, 2] {
             session.events.push(Event::AgentRequest {
+                sent_at: Instant::now(),
                 id,
                 input: "inspect".into(),
                 access: AgentAccess::ReadOnly,
@@ -4456,6 +4529,7 @@ mod tests {
         let mut workers = Workers::new(false);
         workers.next_agent_id = 3;
         session.events.push(Event::AgentRequest {
+            sent_at: Instant::now(),
             id: 2,
             input: "inspect".into(),
             access: AgentAccess::ReadOnly,
