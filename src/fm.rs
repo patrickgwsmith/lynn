@@ -39,6 +39,14 @@ const FINAL_SCHEMA: &str = r#"{
 
 const MAX_STEPS: usize = 16;
 
+/// The on-device model's context holds about 8,000 tokens, and session text
+/// and code run about 3 bytes a token, so Lynn keeps each prompt to about
+/// 20 KB and leaves room for the answer.
+const SUMMARY_CONTEXT_BYTES: usize = 18_000;
+const WORKSPACE_CONTEXT_BYTES: usize = 6_000;
+const MAX_OBSERVATION_BYTES: usize = 6_000;
+const MAX_OBSERVATIONS_BYTES: usize = 10_000;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum StepMode {
     Tools,
@@ -57,10 +65,11 @@ fn task_scope(task: &str, references: &str) -> TaskScope {
         .split_whitespace()
         .next()
         .unwrap_or("")
+        .trim_end_matches([':', ',', '.'])
         .to_ascii_lowercase();
     let summarizes = matches!(
         first_word.as_str(),
-        "summarize" | "summarise" | "shorten" | "rephrase"
+        "summarize" | "summarise" | "summary" | "recap" | "tldr" | "tl;dr" | "shorten" | "rephrase"
     );
     let references_reply = task
         .split(|character: char| {
@@ -149,9 +158,13 @@ pub fn run(
 ) -> Result<String, String> {
     match task_scope(task, references) {
         TaskScope::ReferenceSummary => {
-            return respond_text(&summary_prompt(task, references, access))
+            let references = recent(references, SUMMARY_CONTEXT_BYTES);
+            return respond_text(&summary_prompt(task, &references, access));
         }
-        TaskScope::SessionSummary => return respond_text(&summary_prompt(task, context, access)),
+        TaskScope::SessionSummary => {
+            let context = recent(context, SUMMARY_CONTEXT_BYTES);
+            return respond_text(&summary_prompt(task, &context, access));
+        }
         TaskScope::Workspace => {}
     }
     let root = cwd.canonicalize().map_err(|e| format!("workspace: {e}"))?;
@@ -185,7 +198,11 @@ fn run_with(
     access: AgentAccess,
     mut respond: impl FnMut(StepMode, &str) -> Result<Value, String>,
 ) -> Result<String, String> {
-    let mut observations = format!("Workspace entries (root):\n{}\n", list(root, ".")?);
+    let context = recent(context, WORKSPACE_CONTEXT_BYTES);
+    let mut observations = format!(
+        "Workspace entries (root):\n{}\n",
+        limit(&list(root, ".")?, MAX_OBSERVATION_BYTES)
+    );
     let mut seen: HashMap<(String, String, String), String> = HashMap::new();
     let mut next_mode = StepMode::Tools;
     for step_number in 0..MAX_STEPS {
@@ -242,7 +259,7 @@ fn run_with(
         if let Some(previous_result) = seen.get(&key) {
             observations.push_str(&format!(
                 "\nRepeated {action} {path} was skipped. Earlier result: {}\n",
-                limit(previous_result, 4_000)
+                limit(previous_result, MAX_OBSERVATION_BYTES)
             ));
             next_mode = StepMode::Final;
             continue;
@@ -259,9 +276,12 @@ fn run_with(
             Err(error) => format!("ERROR: {error}"),
         };
         seen.insert(key, result.clone());
-        observations.push_str(&format!("\n{action} {path}: {}\n", limit(&result, 12_000)));
-        if observations.len() > 32_000 {
-            observations = tail(&observations, 24_000);
+        observations.push_str(&format!(
+            "\n{action} {path}: {}\n",
+            limit(&result, MAX_OBSERVATION_BYTES)
+        ));
+        if observations.len() > MAX_OBSERVATIONS_BYTES {
+            observations = recent(&observations, MAX_OBSERVATIONS_BYTES);
         }
     }
     Err("fm did not provide a final answer".into())
@@ -427,6 +447,21 @@ fn limit(text: &str, max: usize) -> String {
     format!("{}\n[truncated]", &text[..boundary])
 }
 
+/// Keeps the end of `text`, which holds the request and the latest results,
+/// starting at a line boundary and noting that earlier text was left out.
+fn recent(text: &str, max: usize) -> String {
+    const OMITTED: &str = "[earlier text omitted]\n";
+    if text.len() <= max {
+        return text.to_owned();
+    }
+    let kept = tail(text, max.saturating_sub(OMITTED.len()));
+    let kept = match kept.split_once('\n') {
+        Some((_, rest)) if !rest.is_empty() => rest,
+        _ => &kept,
+    };
+    format!("{OMITTED}{kept}")
+}
+
 pub fn tail(text: &str, max: usize) -> String {
     if text.len() <= max {
         return text.to_owned();
@@ -441,8 +476,8 @@ pub fn tail(text: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        list, read, run_with, summary_prompt, task_scope, AgentAccess, StepMode, TaskScope,
-        MAX_STEPS,
+        list, read, recent, run_with, summary_prompt, task_scope, AgentAccess, StepMode, TaskScope,
+        MAX_STEPS, SUMMARY_CONTEXT_BYTES,
     };
     use serde_json::json;
     use std::fs;
@@ -520,6 +555,22 @@ mod tests {
         );
         assert_eq!(super::clean_prompt_summary("  \n \"\" "), None);
         assert!(super::prompt_summary_prompt("fix it", 42).contains("at most 42 characters"));
+    }
+
+    #[test]
+    fn long_context_keeps_recent_lines_within_budget() {
+        let context: String = (0..5_000).map(|n| format!("line {n}\n")).collect();
+        let kept = recent(&context, SUMMARY_CONTEXT_BYTES);
+        assert!(kept.len() <= SUMMARY_CONTEXT_BYTES);
+        assert!(kept.starts_with("[earlier text omitted]\nline "));
+        assert!(kept.ends_with("line 4999\n"));
+        assert_eq!(recent("short\n", 100), "short\n");
+        assert_eq!(task_scope("summary", ""), TaskScope::SessionSummary);
+        assert_eq!(task_scope("tldr", ""), TaskScope::SessionSummary);
+        assert_eq!(
+            task_scope("TL;DR: the ops/s", ""),
+            TaskScope::SessionSummary
+        );
     }
 
     #[test]

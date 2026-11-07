@@ -204,7 +204,7 @@ To send many read-only `fm` requests, enter `fm?` or `fm!` with no task. The pro
 
 Lynn examines tool access for each `fm` step. Lynn skips repeated tool calls. When the step limit is reached, Lynn tells the agent to give a final answer.
 
-For a summary of earlier session results, such as `fm? summarize the ops/s`, Lynn sends the shared session context directly to `fm` instead of starting a file search. Refer to a specific reply with `#n` when you want that reply alone summarized.
+For a summary of earlier session results, such as `fm? summarize the ops/s` or `fm? tldr`, Lynn sends the shared session context directly to `fm` instead of starting a file search. Refer to a specific reply with `#n` when you want that reply alone summarized. `fm` has a small context window of about 8,000 tokens, so when the session is too long Lynn sends only its most recent part, about 18 KB. Workspace requests get the last 6 KB of the session, plus tool results capped at 10 KB.
 
 ## Shell commands
 
