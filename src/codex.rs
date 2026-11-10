@@ -141,7 +141,7 @@ pub fn run_live(
                 let stderr = stderr.trim();
                 (!stderr.is_empty()).then_some(stderr)
             })
-            .or_else(|| stream_error.as_deref());
+            .or(stream_error.as_deref());
         return match detail {
             Some(detail) => Err(format!("codex {status}: {}", detail.trim())),
             None => Err(format!("codex {status}")),
