@@ -192,10 +192,8 @@ fn render_agent_with_models(
     match display {
         AgentDisplay::Working => format!("{label}: …"),
         AgentDisplay::Answer(text) | AgentDisplay::FullAnswer(text) if color => {
-            format!(
-                "\x1b[1;35m{label}{detail}:\x1b[0m {}",
-                highlight_answer(text)
-            )
+            let ansi = label_ansi(&label);
+            format!("{ansi}{label}{detail}:\x1b[0m {}", highlight_answer(text))
         }
         AgentDisplay::Answer(text) | AgentDisplay::FullAnswer(text) => {
             format!("{label}{detail}: {text}")
@@ -279,6 +277,31 @@ fn format_ago(age: Duration) -> String {
     }
 }
 
+/// Read-only labels are green like `opus?`; read-write and live ones magenta.
+fn label_ansi(label: &AgentLabel) -> &'static str {
+    if label.access == AgentAccess::ReadOnly && label.output == AgentOutput::Final {
+        "\x1b[1;32m"
+    } else {
+        "\x1b[1;35m"
+    }
+}
+
+/// Colours the `opus?#2` label at the start of a pending request's status
+/// line, such as `opus?#2: …` or `opus!#3: waiting for opus!#1`, to match
+/// answer labels.
+fn color_status_label(session: &Session, id: usize, status: &str, color: bool) -> String {
+    let Some(label) = agent_label_by_id(session, id).filter(|_| color) else {
+        return status.to_owned();
+    };
+    match status.split_once(": ") {
+        Some((head, rest)) => format!("{}{head}:\x1b[0m {rest}", label_ansi(&label)),
+        None => match status.strip_suffix(':') {
+            Some(head) => format!("{}{head}:\x1b[0m", label_ansi(&label)),
+            None => status.to_owned(),
+        },
+    }
+}
+
 fn emphasize_prompt(prompt: &str, color: bool) -> String {
     if color {
         format!("\x1b[1m{prompt}\x1b[0m")
@@ -346,7 +369,11 @@ fn pending_agent_statuses_with_width(
                 let prefix = format!("{label}: ");
                 let text = prompt.summary.as_deref().unwrap_or(input);
                 let text = one_line_prompt(text, prompt_room(&prefix, columns));
-                statuses.push(format!("{prefix}{}", emphasize_prompt(&text, color)));
+                statuses.push(format!(
+                    "{}{}",
+                    color_status_label(session, id, &prefix, color),
+                    emphasize_prompt(&text, color)
+                ));
                 continue;
             }
         }
@@ -370,7 +397,7 @@ fn pending_agent_statuses_with_width(
                 }
             }
         }
-        statuses.push(status.clone());
+        statuses.push(color_status_label(session, id, status, color));
     }
     statuses.extend(workers.pending_http.values().cloned());
     statuses
@@ -698,12 +725,16 @@ fn main() {
             let full_prompt = prompt(session.mode, &session.cwd, true, color);
             let statuses = pending_agent_statuses(&session, &workers, color);
             let todos = session.todos.clone();
+            terminal.set_references(reference_sources(&session));
+            terminal.set_code_spans(recent_code_spans(&session));
             let line = match terminal.read_line(
-                &short_prompt,
-                &full_prompt,
-                session.detail,
-                color,
-                &todos,
+                terminal::PromptView {
+                    prompt: &short_prompt,
+                    full_prompt: &full_prompt,
+                    detail: session.detail,
+                    color,
+                    todos: &todos,
+                },
                 statuses,
                 workers.wake_reader.as_raw_fd(),
                 |line| {
@@ -799,7 +830,7 @@ fn prompt(mode: PromptMode, cwd: &Path, full: bool, color: bool) -> String {
         (PromptMode::FmReadOnly, false) => format!("fm? {location}> "),
         (PromptMode::Shell, true) => format!("\x1b[1;36m{location}>\x1b[0m "),
         (PromptMode::FmReadOnly, true) => {
-            format!("\x1b[1;35mfm?\x1b[0m \x1b[1;36m{location}>\x1b[0m ")
+            format!("\x1b[1;32mfm?\x1b[0m \x1b[1;36m{location}>\x1b[0m ")
         }
     }
 }
@@ -885,6 +916,7 @@ fn handle(
         return None;
     }
     for update in drain_updates(workers, session) {
+        terminal.forget_entered();
         println!("{update}");
     }
     if session.mode == PromptMode::FmReadOnly && line.trim() == "?" {
@@ -1006,7 +1038,14 @@ fn handle(
                 status,
             });
         }
-        Input::Comment(comment) => session.events.push(Event::Comment(comment.into())),
+        Input::Comment(comment) => {
+            let id = workers.next_result_id();
+            session.events.push(Event::Comment {
+                id,
+                text: comment.into(),
+            });
+            println!("[note #{id}]");
+        }
         Input::LatestAgentResponse => match latest_agent_response(session) {
             Some((label, text)) => {
                 println!(
@@ -1063,6 +1102,7 @@ fn handle(
         Input::AgentNumberReference { id } if agent_label_by_id(session, id).is_none() => {
             match watch_response_by_id(session, id, None)
                 .or_else(|| http_response_by_id(session, id))
+                .or_else(|| note_by_id(session, id).map(|text| format!("# {text}")))
             {
                 Some(text) => {
                     println!("{text}");
@@ -1150,10 +1190,12 @@ fn handle(
             }
         }
         Input::LiveHostShell { program, command } => {
-            start_live_command(program, command, session, workers)
+            start_live_command(program, command, session, workers, terminal)
         }
-        Input::LiveHead(url) => start_live_head(url, session, workers),
-        Input::LiveFeed(url, selection) => start_live_feed(url, selection, session, workers),
+        Input::LiveHead(url) => start_live_head(url, session, workers, terminal),
+        Input::LiveFeed(url, selection) => {
+            start_live_feed(url, selection, session, workers, terminal)
+        }
         Input::LiveDiff(mode) => show_live_diff(session, workers, mode),
         Input::EnterFm => {
             session.mode = PromptMode::FmReadOnly;
@@ -1730,6 +1772,7 @@ fn start_live_command(
     command: &str,
     session: &mut Session,
     workers: &mut Workers,
+    terminal: &mut terminal::Terminal,
 ) {
     let command = command.trim();
     if command.is_empty() {
@@ -1744,10 +1787,16 @@ fn start_live_command(
         },
         session,
         workers,
+        terminal,
     );
 }
 
-fn start_live_head(url: &str, session: &mut Session, workers: &mut Workers) {
+fn start_live_head(
+    url: &str,
+    session: &mut Session,
+    workers: &mut Workers,
+    terminal: &mut terminal::Terminal,
+) {
     if let Err(error) = http::origin(url) {
         eprintln!("lynn: {error}");
         session.last_status = 1;
@@ -1759,6 +1808,7 @@ fn start_live_head(url: &str, session: &mut Session, workers: &mut Workers) {
         },
         session,
         workers,
+        terminal,
     );
 }
 
@@ -1767,6 +1817,7 @@ fn start_live_feed(
     selection: FeedSelection,
     session: &mut Session,
     workers: &mut Workers,
+    terminal: &mut terminal::Terminal,
 ) {
     if let Err(error) = http::origin(url) {
         eprintln!("lynn: {error}");
@@ -1780,10 +1831,16 @@ fn start_live_feed(
         },
         session,
         workers,
+        terminal,
     );
 }
 
-fn start_live(target: LiveTarget, session: &mut Session, workers: &mut Workers) {
+fn start_live(
+    target: LiveTarget,
+    session: &mut Session,
+    workers: &mut Workers,
+    terminal: &mut terminal::Terminal,
+) {
     if let Some(existing) = session
         .live_commands
         .iter()
@@ -1809,10 +1866,18 @@ fn start_live(target: LiveTarget, session: &mut Session, workers: &mut Workers) 
         last_refresh: Instant::now(),
         revisions: Vec::new(),
     });
-    println!(
-        "[watch #{id} loading] {}",
-        session.live_commands.last().unwrap().label()
-    );
+    // Show the number on the typed line; only print it separately when that
+    // line isn't the last thing on screen (or there is no typed line).
+    let labelled = workers.interactive
+        && terminal
+            .label_entered(&format!("#{id}"), output_color())
+            .unwrap_or(false);
+    if !labelled {
+        println!(
+            "[watch #{id} loading] {}",
+            session.live_commands.last().unwrap().label()
+        );
+    }
     workers.active_live += 1;
     let tx = workers.live_tx.clone();
     std::thread::spawn(move || {
@@ -2180,14 +2245,16 @@ fn session_context_filtered(
     for event in session.events.iter().filter(|event| match event {
         Event::AgentRequest { id, .. } => Some(*id) != current_request_id,
         Event::AgentResponse { id, .. } => !referenced_ids.contains(id),
-        Event::Resource { id, .. } | Event::HttpHead { id, .. } => !referenced_ids.contains(id),
+        Event::Resource { id, .. } | Event::HttpHead { id, .. } | Event::Comment { id, .. } => {
+            !referenced_ids.contains(id)
+        }
         _ => true,
     }) {
         match event {
             Event::Command { input, status } => {
                 context.push_str(&format!("command: {input} (exit {status})\n"))
             }
-            Event::Comment(text) => context.push_str(&format!("comment: {text}\n")),
+            Event::Comment { id, text } => context.push_str(&format!("comment (#{id}): {text}\n")),
             Event::AgentRequest {
                 id,
                 input,
@@ -2369,6 +2436,53 @@ fn latest_agent_response(session: &Session) -> Option<(AgentLabel<'_>, &str)> {
     })
 }
 
+/// Where each numbered entry came from, so a typed `#n` takes its source's colour.
+fn reference_sources(session: &Session) -> HashMap<usize, terminal::ReferenceSource> {
+    let mut sources: HashMap<_, _> = session
+        .events
+        .iter()
+        .filter_map(|event| match event {
+            Event::AgentRequest {
+                id, access, output, ..
+            } => Some((
+                *id,
+                if *access == AgentAccess::ReadOnly && *output != AgentOutput::Live {
+                    terminal::ReferenceSource::ReadOnlyAgent
+                } else {
+                    terminal::ReferenceSource::ReadWriteAgent
+                },
+            )),
+            // `HEAD` is a reader selector; plain URL loads have none and stay cyan.
+            Event::HttpHead { id, .. } => Some((*id, terminal::ReferenceSource::Reader)),
+            Event::Comment { id, .. } => Some((*id, terminal::ReferenceSource::Note)),
+            _ => None,
+        })
+        .collect();
+    for watch in &session.live_commands {
+        sources.insert(watch.id, terminal::ReferenceSource::Reader);
+    }
+    sources
+}
+
+/// How many of the latest agent answers backtick completion draws from.
+const CODE_SPAN_ANSWERS: usize = 3;
+
+/// The `code` spans in the latest agent answers, most recent answer first,
+/// for completing after a typed backtick.
+fn recent_code_spans(session: &Session) -> Vec<String> {
+    session
+        .events
+        .iter()
+        .rev()
+        .filter_map(|event| match event {
+            Event::AgentResponse { text, .. } => Some(text),
+            _ => None,
+        })
+        .take(CODE_SPAN_ANSWERS)
+        .flat_map(|text| terminal::code_spans_in(text))
+        .collect()
+}
+
 /// The label of the agent request with this id, with its recorded effort and output.
 fn agent_label_by_id(session: &Session, id: usize) -> Option<AgentLabel<'_>> {
     session.events.iter().find_map(|event| match event {
@@ -2396,6 +2510,14 @@ fn agent_user_by_id(session: &Session, id: usize) -> AgentUser {
             _ => None,
         })
         .unwrap_or(AgentUser::Current)
+}
+
+/// The text of the `# note` with this id.
+fn note_by_id(session: &Session, id: usize) -> Option<&str> {
+    session.events.iter().find_map(|event| match event {
+        Event::Comment { id: note_id, text } if *note_id == id => Some(text.as_str()),
+        _ => None,
+    })
 }
 
 fn http_response_by_id(session: &Session, id: usize) -> Option<String> {
@@ -2666,6 +2788,11 @@ fn resolve_references(
             } else if let Some(text) = http_response_by_id(session, id) {
                 if seen.insert(id) {
                     context.push_str(&format!("\nReferenced HTTP result #{id}:\n{text}\n"));
+                }
+                None
+            } else if let Some(text) = note_by_id(session, id) {
+                if seen.insert(id) {
+                    context.push_str(&format!("\nReferenced note #{id}:\n{text}\n"));
                 }
                 None
             } else {
@@ -2989,12 +3116,40 @@ mod tests {
     use std::path::Path;
     use std::time::{Duration, Instant};
 
+    fn note(id: usize, text: &str) -> Event {
+        Event::Comment {
+            id,
+            text: text.into(),
+        }
+    }
+
+    #[test]
+    fn notes_are_numbered_and_can_be_referenced() {
+        let mut session = Session::new().unwrap();
+        let workers = Workers::new(false);
+        session.events.push(note(4, "prefer the smaller fix"));
+        let references = super::ready_references("opus? follow #4", &session, &workers).unwrap();
+        assert_eq!(
+            references.text,
+            "\nReferenced note #4:\nprefer the smaller fix\n"
+        );
+        let context =
+            super::session_context_filtered(&session, &references.ids, None, &session.cwd);
+        assert!(!context.contains("prefer the smaller fix"));
+        assert!(session_context(&session).contains("comment (#4): prefer the smaller fix\n"));
+        assert_eq!(
+            super::reference_sources(&session).get(&4),
+            Some(&crate::terminal::ReferenceSource::Note)
+        );
+        assert!(super::ready_references("opus? follow #5", &session, &workers).is_err());
+    }
+
     #[test]
     fn conversation_context_retains_early_instructions_and_large_replies() {
         let mut session = Session::new().unwrap();
-        session.events.push(Event::Comment(
-            "Always preserve the existing CLI syntax".into(),
-        ));
+        session
+            .events
+            .push(note(90, "Always preserve the existing CLI syntax"));
         session.events.push(Event::AgentRequest {
             sent_at: Instant::now(),
             id: 1,
@@ -3023,25 +3178,22 @@ mod tests {
                 status: 0,
             });
         }
-        session
-            .events
-            .push(Event::Comment("Latest instruction".into()));
+        session.events.push(note(91, "Latest instruction"));
         session.todos.push(crate::session::Todo {
             text: "Validate cancellation".into(),
             done: false,
         });
         let context = session_context(&session);
         assert!(context.starts_with(&format!("cwd: {}\n", session.cwd.display())));
-        assert!(context.contains("comment: Always preserve the existing CLI syntax\n"));
+        assert!(context.contains("comment (#90): Always preserve the existing CLI syntax\n"));
         assert!(context.contains(
             "request (opus!#1, read-write): Keep mutating agents serial across all models\n"
         ));
         assert!(context.contains(&format!("response (opus!#1): {reply}\n")));
         assert!(context.contains("command: command-0 (exit 0)\n"));
         assert!(context.contains("command: command-99 (exit 0)\n"));
-        assert!(
-            context.ends_with("comment: Latest instruction\ntodo: - [ ] Validate cancellation\n")
-        );
+        assert!(context
+            .ends_with("comment (#91): Latest instruction\ntodo: - [ ] Validate cancellation\n"));
         assert!(
             context.find("Always preserve").unwrap() < context.find("Earlier findings").unwrap()
         );
@@ -3053,9 +3205,7 @@ mod tests {
     #[test]
     fn web_excerpts_report_omissions_and_explicit_references_retain_full_content() {
         let mut session = Session::new().unwrap();
-        session
-            .events
-            .push(Event::Comment("Preserve this instruction".into()));
+        session.events.push(note(90, "Preserve this instruction"));
         session.events.push(Event::Resource {
             id: 3,
             resource: crate::session::Resource {
@@ -3066,7 +3216,7 @@ mod tests {
             },
         });
         let context = session_context(&session);
-        assert!(context.contains("comment: Preserve this instruction\n"));
+        assert!(context.contains("comment (#90): Preserve this instruction\n"));
         assert!(context.contains(&"α".repeat(8_000)));
         assert!(!context.contains("TAIL_OF_PAGE"));
         assert!(context.contains("more web page content omitted; refer to #3"));
@@ -3077,7 +3227,7 @@ mod tests {
         let automatic =
             super::session_context_filtered(&session, &references.ids, None, &session.cwd);
         assert!(!automatic.contains("resource:"));
-        assert!(automatic.contains("comment: Preserve this instruction\n"));
+        assert!(automatic.contains("comment (#90): Preserve this instruction\n"));
     }
 
     #[test]
@@ -3260,7 +3410,7 @@ mod tests {
             super::pending_agent_statuses(&session, &workers, true),
             [
                 "\x1b[1mopus?!#4 prompt [just now]: Implement cancellation\nPreserve existing labels\x1b[0m",
-                "opus?!#4: Read: src/main.rs",
+                "\x1b[1;35mopus?!#4:\x1b[0m Read: src/main.rs",
             ]
         );
         session.detail = DisplayDetail::Compact;
@@ -3414,6 +3564,14 @@ mod tests {
         assert_eq!(
             super::pending_agent_statuses_with_width(&session, &workers, false, 20)[0],
             "opus!#5: Update th…"
+        );
+        // With colour, labels match answer labels: magenta for `!`, green for `?`.
+        assert_eq!(
+            super::pending_agent_statuses_with_width(&session, &workers, true, 80),
+            [
+                "\x1b[1;35mopus!#5:\x1b[0m \x1b[1mUpdate the tests\x1b[0m",
+                "\x1b[1;32mopus?#6:\x1b[0m …"
+            ]
         );
         session.detail = DisplayDetail::Expanded;
         assert_eq!(
@@ -3705,7 +3863,7 @@ mod tests {
             "jsc?!#2: paused while you write a # note"
         );
 
-        session.events.push(Event::Comment("steer this way".into()));
+        session.events.push(note(90, "steer this way"));
         super::set_note_hold(&session, &mut workers, false);
         assert!(workers.queued_agents.is_empty());
         assert_eq!(workers.running_writer, Some(2));
@@ -4002,7 +4160,7 @@ mod tests {
     #[test]
     fn reset_restarts_counters_and_discards_old_worker_updates() {
         let mut session = Session::new().unwrap();
-        session.events.push(Event::Comment("old context".into()));
+        session.events.push(note(90, "old context"));
         session.todos.push(crate::session::Todo {
             text: "old todo".into(),
             done: false,
@@ -4271,7 +4429,7 @@ mod tests {
             elapsed: None,
         });
         for _ in 0..25 {
-            session.events.push(Event::Comment("later context".into()));
+            session.events.push(note(90, "later context"));
         }
         assert!(session_context(&session).contains("multiline finding"));
         assert_eq!(
@@ -4551,9 +4709,7 @@ mod tests {
         );
         let request_cwd = session.cwd.clone();
         session.cwd = Path::new("/tmp/changed-while-waiting").into();
-        session
-            .events
-            .push(Event::Comment("added while waiting".into()));
+        session.events.push(note(90, "added while waiting"));
         session.events.push(Event::AgentResponse {
             id: 2,
             model: "sol".into(),
@@ -4569,7 +4725,7 @@ mod tests {
         };
         let context = agent_context(&session, &workers.queued_agents[&3], &references);
         assert!(context.starts_with(&format!("cwd: {}\n", request_cwd.display())));
-        assert!(context.contains("comment: added while waiting"));
+        assert!(context.contains("comment (#90): added while waiting"));
         assert_eq!(context.matches("unique reply").count(), 1);
         assert!(!context.contains("response (sol?#2):"));
         assert_eq!(context.matches("request (luna?#3").count(), 1);

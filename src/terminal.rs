@@ -1,5 +1,5 @@
 use crate::session::DisplayDetail;
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::ffi::OsStr;
 use std::io::{self, Write};
 use std::os::fd::{AsRawFd, RawFd};
@@ -52,6 +52,53 @@ impl Drop for RawMode {
 pub struct Terminal {
     history: Vec<String>,
     kill_ring: Vec<u8>,
+    references: HashMap<usize, ReferenceSource>,
+    code_spans: Vec<String>,
+    /// The line most recently entered, while nothing has been printed below it,
+    /// so a number assigned to it can be shown on that line.
+    entered: Option<EnteredLine>,
+}
+
+struct EnteredLine {
+    /// The prompt and styled input as drawn.
+    styled: String,
+    /// How many rows up the line starts from the cursor.
+    rows: usize,
+}
+
+/// What a numbered session entry came from, so `#n` can share its selector's colour.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReferenceSource {
+    /// A read-only agent request such as `opus? ...`.
+    ReadOnlyAgent,
+    /// A read-write agent request such as `opus! ...` or `opus?! ...`.
+    ReadWriteAgent,
+    /// A reader-account watch or fetch such as `+ bash? ...`, `+ HEAD ...` or `HEAD ...`.
+    Reader,
+    /// A `# note`.
+    Note,
+}
+
+/// What the editor shows before the input and what Tab can complete from it.
+#[derive(Clone, Copy)]
+pub struct PromptView<'a> {
+    /// The prompt shown in compact mode.
+    pub prompt: &'a str,
+    /// The prompt shown in expanded mode.
+    pub full_prompt: &'a str,
+    pub detail: DisplayDetail,
+    pub color: bool,
+    pub todos: &'a [crate::session::Todo],
+}
+
+impl<'a> PromptView<'a> {
+    /// The prompt text for the current display detail.
+    fn text(&self) -> &'a str {
+        match self.detail {
+            DisplayDetail::Compact => self.prompt,
+            DisplayDetail::Expanded => self.full_prompt,
+        }
+    }
 }
 
 pub enum ReadResult {
@@ -105,20 +152,64 @@ impl Terminal {
         Self {
             history: Vec::new(),
             kill_ring: Vec::new(),
+            references: HashMap::new(),
+            code_spans: Vec::new(),
+            entered: None,
         }
+    }
+
+    /// Forget the entered line because output now follows it.
+    pub fn forget_entered(&mut self) {
+        self.entered = None;
+    }
+
+    /// Redraw the line just entered with `label` after it, such as a watch's
+    /// `#79`. Returns false, drawing nothing, when that line is no longer the
+    /// last thing on screen.
+    pub fn label_entered(&mut self, label: &str, color: bool) -> io::Result<bool> {
+        let Some(entered) = self.entered.take() else {
+            return Ok(false);
+        };
+        if unsafe { libc::isatty(1) } != 1 {
+            return Ok(false);
+        }
+        let label = if color {
+            format!("  {}{label}\x1b[0m", SelectorKind::ReaderShell.ansi())
+        } else {
+            format!("  {label}")
+        };
+        let mut stdout = io::stdout().lock();
+        stdout.write_all(b"\r")?;
+        if entered.rows > 0 {
+            write!(stdout, "\x1b[{}A", entered.rows)?;
+        }
+        stdout.write_all(b"\r\x1b[0J")?;
+        write_entered_line(&mut stdout, &format!("{}{label}", entered.styled))?;
+        stdout.flush()?;
+        Ok(true)
+    }
+
+    /// Set which source each `#n` refers to; unknown numbers keep the plain reference colour.
+    pub fn set_references(&mut self, references: HashMap<usize, ReferenceSource>) {
+        self.references = references;
+    }
+
+    /// Set the `code` spans from recent answers, most recent first, that Tab
+    /// offers after an opening backtick.
+    pub fn set_code_spans(&mut self, code_spans: Vec<String>) {
+        self.code_spans = code_spans;
     }
 
     pub fn read_line(
         &mut self,
-        prompt: &str,
-        full_prompt: &str,
-        detail: DisplayDetail,
-        color: bool,
-        todos: &[crate::session::Todo],
+        view: PromptView,
         mut statuses: Vec<String>,
         wake_fd: RawFd,
         mut notices: impl FnMut(&[u8]) -> (Vec<String>, Vec<String>),
     ) -> io::Result<ReadResult> {
+        self.entered = None;
+        let prompt = view.text();
+        let color = view.color;
         let _raw = RawMode::new()?;
         let mut bytes = Vec::<u8>::new();
         let mut cursor = 0;
@@ -132,7 +223,8 @@ impl Terminal {
             &bytes,
             cursor,
             &self.history,
-            prompt_for_display(prompt, full_prompt, detail),
+            &self.references,
+            prompt,
             color,
         )?;
         loop {
@@ -152,7 +244,8 @@ impl Terminal {
                             &bytes,
                             cursor,
                             &self.history,
-                            prompt_for_display(prompt, full_prompt, detail),
+                            &self.references,
+                            prompt,
                             color,
                         )?;
                     }
@@ -162,16 +255,20 @@ impl Terminal {
             let previous_kill = last_kill.take();
             match key {
                 b'\r' | b'\n' => {
+                    let mut styled = prompt.as_bytes().to_vec();
+                    write_input_style(
+                        &mut styled,
+                        &format_line(&bytes),
+                        color,
+                        InputStyle::Entered,
+                        &self.references,
+                    )?;
+                    let styled = String::from_utf8_lossy(&styled).into_owned();
                     let mut stdout = io::stdout().lock();
                     clear_editor(&mut stdout, status_rows, &mut display)?;
-                    write!(
-                        stdout,
-                        "{}",
-                        prompt_for_display(prompt, full_prompt, detail)
-                    )?;
-                    write_entered_input(&mut stdout, &format_line(&bytes), color)?;
-                    stdout.write_all(b"\r\n")?;
+                    let rows = write_entered_line(&mut stdout, &styled)?;
                     stdout.flush()?;
+                    self.entered = Some(EnteredLine { styled, rows });
                     let line = String::from_utf8_lossy(&bytes).into_owned();
                     if !line.trim().is_empty() && self.history.last() != Some(&line) {
                         self.history.push(line.clone());
@@ -181,12 +278,14 @@ impl Terminal {
                 3 => {
                     let mut stdout = io::stdout().lock();
                     clear_editor(&mut stdout, status_rows, &mut display)?;
-                    write!(
-                        stdout,
-                        "{}",
-                        prompt_for_display(prompt, full_prompt, detail)
+                    write!(stdout, "{}", prompt)?;
+                    write_input_style(
+                        &mut stdout,
+                        &format_line(&bytes),
+                        color,
+                        InputStyle::Entered,
+                        &self.references,
                     )?;
-                    write_entered_input(&mut stdout, &format_line(&bytes), color)?;
                     stdout.write_all(b"^C\r\n")?;
                     stdout.flush()?;
                     return Ok(ReadResult::Interrupt);
@@ -275,7 +374,8 @@ impl Terminal {
                 }
                 9 => {
                     if let Ok(line) = std::str::from_utf8(&bytes) {
-                        let completion = completions(line, cursor, &self.history, todos);
+                        let completion =
+                            completions(line, cursor, &self.history, view.todos, &self.code_spans);
                         if !completion.matches.is_empty() {
                             let replacement = if completion.matches.len() == 1 {
                                 completion.matches[0].clone()
@@ -433,7 +533,8 @@ impl Terminal {
                 &bytes,
                 cursor,
                 &self.history,
-                prompt_for_display(prompt, full_prompt, detail),
+                &self.references,
+                prompt,
                 color,
             )?;
         }
@@ -459,13 +560,6 @@ fn show_notices(
     *status_rows = write_statuses(&mut stdout, statuses)?;
     stdout.flush()?;
     Ok(true)
-}
-
-fn prompt_for_display<'a>(short: &'a str, full: &'a str, detail: DisplayDetail) -> &'a str {
-    match detail {
-        DisplayDetail::Compact => short,
-        DisplayDetail::Expanded => full,
-    }
 }
 
 fn clear_editor(
@@ -787,11 +881,32 @@ fn write_wrapped(mut output: impl Write, styled: &str, width: usize) -> io::Resu
     Ok(position)
 }
 
+/// Writes an entered line, wrapped like the editor, and moves to the next row.
+/// Returns how many rows the cursor ends below the line's first row.
+fn write_entered_line(output: impl Write, styled: &str) -> io::Result<usize> {
+    write_entered_line_with_width(output, styled, columns().saturating_sub(1).max(2))
+}
+
+fn write_entered_line_with_width(
+    mut output: impl Write,
+    styled: &str,
+    width: usize,
+) -> io::Result<usize> {
+    let end = write_wrapped(&mut output, styled, width)?;
+    if end.column > 0 || end.row == 0 {
+        output.write_all(b"\r\n")?;
+        Ok(end.row + 1)
+    } else {
+        Ok(end.row)
+    }
+}
+
 fn redraw(
     display: &mut EditorDisplay,
     bytes: &[u8],
     cursor: usize,
     history: &[String],
+    references: &HashMap<usize, ReferenceSource>,
     prompt: &str,
     color: bool,
 ) -> io::Result<()> {
@@ -808,7 +923,7 @@ fn redraw(
     };
     let width = columns().saturating_sub(1).max(2);
     let mut styled = prompt.as_bytes().to_vec();
-    write_entered_input(&mut styled, &line, color)?;
+    write_input_style(&mut styled, &line, color, InputStyle::Entered, references)?;
     if !suggestion.is_empty() {
         write!(styled, "\x1b[2m{suggestion}\x1b[0m")?;
     }
@@ -836,11 +951,12 @@ enum InputStyle {
 }
 
 fn write_input(output: impl Write, line: &str, color: bool) -> io::Result<()> {
-    write_input_style(output, line, color, InputStyle::Example)
+    write_input_style(output, line, color, InputStyle::Example, &HashMap::new())
 }
 
+#[cfg(test)]
 fn write_entered_input(output: impl Write, line: &str, color: bool) -> io::Result<()> {
-    write_input_style(output, line, color, InputStyle::Entered)
+    write_input_style(output, line, color, InputStyle::Entered, &HashMap::new())
 }
 
 fn write_input_style(
@@ -848,6 +964,7 @@ fn write_input_style(
     line: &str,
     color: bool,
     style: InputStyle,
+    references: &HashMap<usize, ReferenceSource>,
 ) -> io::Result<()> {
     if !color {
         return output.write_all(line.as_bytes());
@@ -855,14 +972,19 @@ fn write_input_style(
     if matches!(style, InputStyle::Entered) {
         output.write_all(b"\x1b[1m")?;
     }
-    write_input_parts(&mut output, line, style)?;
+    write_input_parts(&mut output, line, style, references)?;
     if matches!(style, InputStyle::Entered) {
         output.write_all(b"\x1b[0m")?;
     }
     Ok(())
 }
 
-fn write_input_parts(mut output: impl Write, line: &str, style: InputStyle) -> io::Result<()> {
+fn write_input_parts(
+    mut output: impl Write,
+    line: &str,
+    style: InputStyle,
+    references: &HashMap<usize, ReferenceSource>,
+) -> io::Result<()> {
     if let Some((start, end, kind)) = selector_highlight(line) {
         write!(
             output,
@@ -881,20 +1003,22 @@ fn write_input_parts(mut output: impl Write, line: &str, style: InputStyle) -> i
                 crate::session::classify(&line[start..]),
                 crate::session::Input::Agents(_)
             ) {
-                return write_input_parts(output, &line[end..], style);
+                return write_input_parts(output, &line[end..], style, references);
             }
         }
-        if kind == SelectorKind::Agent {
+        if kind.is_agent() {
             // Colour `#3`, `opus#3` and `#3.2` so a reference typed by accident shows up.
-            write_references(&mut output, &line[end..], style)?;
+            write_references(&mut output, &line[end..], style, references)?;
         } else {
             output.write_all(&line.as_bytes()[end..])?;
         }
     } else if matches!(style, InputStyle::Entered) {
-        if let Some((start, end)) = unknown_command_span(line) {
+        if let Some((start, end, known)) = command_span(line) {
+            // Known commands are blue and unknown ones red; arguments stay plain bold.
+            let ansi = if known { COMMAND_ANSI } else { "\x1b[1;31m" };
             write!(
                 output,
-                "{}\x1b[1;31m{}\x1b[0m\x1b[1m{}",
+                "{}{ansi}{}\x1b[0m\x1b[1m{}",
                 &line[..start],
                 &line[start..end],
                 &line[end..]
@@ -910,18 +1034,38 @@ fn write_input_parts(mut output: impl Write, line: &str, style: InputStyle) -> i
 
 const REFERENCE_ANSI: &str = "\x1b[1;36m";
 
-fn write_references(mut output: impl Write, text: &str, style: InputStyle) -> io::Result<()> {
+/// The colour for a reference: its source's selector colour, or cyan when unknown.
+fn reference_ansi(token: &str, references: &HashMap<usize, ReferenceSource>) -> &'static str {
+    let id = crate::session::watch_revision_reference(token)
+        .map(|(id, _)| id)
+        .or_else(|| crate::session::agent_reference(token).map(|(_, _, id)| id))
+        .or_else(|| crate::session::agent_number_reference(token));
+    match id.and_then(|id| references.get(&id)) {
+        Some(ReferenceSource::ReadOnlyAgent) => SelectorKind::ReadOnlyAgent.ansi(),
+        Some(ReferenceSource::ReadWriteAgent) => SelectorKind::ReadWriteAgent.ansi(),
+        Some(ReferenceSource::Reader) => SelectorKind::ReaderShell.ansi(),
+        Some(ReferenceSource::Note) => NOTE_REFERENCE_ANSI,
+        None => REFERENCE_ANSI,
+    }
+}
+
+/// Notes run nothing, so references to them are grey rather than a selector colour.
+const NOTE_REFERENCE_ANSI: &str = "\x1b[1;90m";
+
+fn write_references(
+    mut output: impl Write,
+    text: &str,
+    style: InputStyle,
+    references: &HashMap<usize, ReferenceSource>,
+) -> io::Result<()> {
     let mut written = 0;
     for (start, token) in crate::session::reference_tokens(text) {
         if !crate::session::is_reference(token) {
             continue;
         }
         let end = start + token.len();
-        write!(
-            output,
-            "{}{REFERENCE_ANSI}{token}\x1b[0m",
-            &text[written..start]
-        )?;
+        let ansi = reference_ansi(token, references);
+        write!(output, "{}{ansi}{token}\x1b[0m", &text[written..start])?;
         if matches!(style, InputStyle::Entered) {
             output.write_all(b"\x1b[1m")?;
         }
@@ -930,13 +1074,23 @@ fn write_references(mut output: impl Write, text: &str, style: InputStyle) -> io
     output.write_all(&text.as_bytes()[written..])
 }
 
-fn unknown_command_span(line: &str) -> Option<(usize, usize)> {
+const COMMAND_ANSI: &str = "\x1b[1;34m";
+
+/// The first command word's byte span and whether it names a runnable command.
+fn command_span(line: &str) -> Option<(usize, usize, bool)> {
     let cwd = std::env::current_dir().ok()?;
     let path = std::env::var_os("PATH")?;
-    unknown_command_span_in(line, &cwd, &path)
+    command_span_in(line, &cwd, &path)
 }
 
+#[cfg(test)]
 fn unknown_command_span_in(line: &str, cwd: &Path, path: &OsStr) -> Option<(usize, usize)> {
+    command_span_in(line, cwd, path)
+        .filter(|&(_, _, known)| !known)
+        .map(|(start, end, _)| (start, end))
+}
+
+fn command_span_in(line: &str, cwd: &Path, path: &OsStr) -> Option<(usize, usize, bool)> {
     let start = line.len() - line.trim_start().len();
     let rest = &line[start..];
     let end = rest
@@ -953,14 +1107,15 @@ fn unknown_command_span_in(line: &str, cwd: &Path, path: &OsStr) -> Option<(usiz
         || word.starts_with(['#', '+', '-', '?', '!', '@', '$', '\'', '"'])
         || word.starts_with("https://")
         || word.starts_with("http://")
-        || matches!(word, "cd" | "exit" | "export" | "unset" | "reset")
         || word
             .split_once('=')
             .is_some_and(|(name, _)| valid_assignment_name(name))
     {
         return None;
     }
-    (!command_exists_in(word, cwd, path)).then_some((start, start + end))
+    let known = matches!(word, "cd" | "exit" | "export" | "unset" | "reset")
+        || command_exists_in(word, cwd, path);
+    Some((start, start + end, known))
 }
 
 fn valid_assignment_name(name: &str) -> bool {
@@ -990,7 +1145,12 @@ pub fn styled_input(line: &str, color: bool) -> String {
 
 #[derive(Debug, PartialEq, Eq)]
 enum SelectorKind {
-    Agent,
+    /// `opus?`, `opus??`, emoji selectors: green like the read-only `bash?`.
+    ReadOnlyAgent,
+    /// `opus!`, `opus!!`, `opus?!`: magenta.
+    ReadWriteAgent,
+    /// `yes` and `yes!` replies, which may inherit either access; magenta.
+    Reply,
     ReaderShell,
     HostShell,
 }
@@ -998,10 +1158,17 @@ enum SelectorKind {
 impl SelectorKind {
     fn ansi(&self) -> &'static str {
         match self {
-            Self::Agent => "\x1b[1;35m",
-            Self::ReaderShell => "\x1b[1;34m",
+            Self::ReadWriteAgent | Self::Reply => "\x1b[1;35m",
+            Self::ReadOnlyAgent | Self::ReaderShell => "\x1b[1;32m",
             Self::HostShell => "\x1b[1;33m",
         }
+    }
+
+    fn is_agent(&self) -> bool {
+        matches!(
+            self,
+            Self::ReadOnlyAgent | Self::ReadWriteAgent | Self::Reply
+        )
     }
 }
 
@@ -1020,23 +1187,8 @@ fn selector_highlight(line: &str) -> Option<(usize, usize, SelectorKind)> {
         SelectorKind::ReaderShell
     } else if !live && matches!(selector, "bash!" | "zsh!") {
         SelectorKind::HostShell
-    } else if !live
-        && (crate::session::AgentModel::from_emoji(selector).is_some()
-            || ["!!", "!!!", "??", "???", "?!"].iter().any(|suffix| {
-                selector
-                    .strip_suffix(suffix)
-                    .is_some_and(|names| names.split('/').all(crate::session::is_agent_model))
-            })
-            || selector
-                .strip_suffix('!')
-                .is_some_and(crate::session::is_agent_model)
-            || selector
-                .strip_suffix('?')
-                .is_some_and(|names| names.split('/').all(crate::session::is_agent_model))
-            || crate::session::pi_model_selector(selector)
-                .is_some_and(|(_, suffix)| matches!(suffix, "?" | "!")))
-    {
-        SelectorKind::Agent
+    } else if let Some(kind) = (!live).then(|| agent_selector_kind(selector)).flatten() {
+        kind
     } else if !live
         && matches!(selector, "yes" | "yes!")
         && matches!(
@@ -1045,11 +1197,47 @@ fn selector_highlight(line: &str) -> Option<(usize, usize, SelectorKind)> {
         )
     {
         // `yes`, `yes!` and `yes! #3` reply to an agent rather than run the `yes` command.
-        SelectorKind::Agent
+        // `yes!` asks for write access; plain `yes` keeps the answer's own access.
+        if selector == "yes!" {
+            SelectorKind::ReadWriteAgent
+        } else {
+            SelectorKind::Reply
+        }
     } else {
         return None;
     };
     Some((start, start + end, kind))
+}
+
+/// Whether `selector` names an agent, and if so whether it is read-only or read-write.
+fn agent_selector_kind(selector: &str) -> Option<SelectorKind> {
+    let models = |names: &str| names.split('/').all(crate::session::is_agent_model);
+    if crate::session::AgentModel::from_emoji(selector).is_some() {
+        return Some(SelectorKind::ReadOnlyAgent);
+    }
+    for (suffix, kind) in [
+        ("?!", SelectorKind::ReadWriteAgent),
+        ("!!!", SelectorKind::ReadWriteAgent),
+        ("!!", SelectorKind::ReadWriteAgent),
+        ("???", SelectorKind::ReadOnlyAgent),
+        ("??", SelectorKind::ReadOnlyAgent),
+        ("?", SelectorKind::ReadOnlyAgent),
+    ] {
+        if selector.strip_suffix(suffix).is_some_and(models) {
+            return Some(kind);
+        }
+    }
+    if selector
+        .strip_suffix('!')
+        .is_some_and(crate::session::is_agent_model)
+    {
+        return Some(SelectorKind::ReadWriteAgent);
+    }
+    match crate::session::pi_model_selector(selector) {
+        Some((_, "?")) => Some(SelectorKind::ReadOnlyAgent),
+        Some((_, "!")) => Some(SelectorKind::ReadWriteAgent),
+        _ => None,
+    }
 }
 
 struct Completion {
@@ -1154,13 +1342,71 @@ fn todo_completion(
     })
 }
 
+/// After an unclosed backtick, completes `code` spans from recent answers and
+/// closes the span. Returns `None` outside a span or when nothing matches, so
+/// Tab falls back to path completion.
+fn code_span_completion(line: &str, cursor: usize, code_spans: &[String]) -> Option<Completion> {
+    let before = &line[..cursor];
+    if before.matches('`').count().is_multiple_of(2) {
+        return None;
+    }
+    let start = before.rfind('`')? + 1;
+    let typed = &before[start..];
+    let end = if line[cursor..].starts_with('`') {
+        cursor + 1
+    } else {
+        cursor
+    };
+    let mut matches: Vec<String> = Vec::new();
+    for span in code_spans {
+        let candidate = format!("{span}`");
+        if span.starts_with(typed) && !matches.contains(&candidate) {
+            matches.push(candidate);
+        }
+    }
+    (!matches.is_empty()).then_some(Completion {
+        start,
+        end,
+        matches,
+    })
+}
+
+/// The single-backtick `code` spans in `text`, in order, skipping fenced blocks.
+pub fn code_spans_in(text: &str) -> Vec<String> {
+    let mut spans = Vec::new();
+    let mut in_fence = false;
+    for line in text.lines() {
+        if line.trim_start().starts_with("```") {
+            in_fence = !in_fence;
+            continue;
+        }
+        if in_fence {
+            continue;
+        }
+        let parts: Vec<&str> = line.split('`').collect();
+        // Odd parts are inside backticks; the last part is only inside if
+        // the line closes it.
+        for part in parts.iter().skip(1).step_by(2).take((parts.len() - 1) / 2) {
+            let part = part.trim();
+            if !part.is_empty() && part.len() <= 200 {
+                spans.push(part.to_owned());
+            }
+        }
+    }
+    spans
+}
+
 fn completions(
     line: &str,
     cursor: usize,
     history: &[String],
     todos: &[crate::session::Todo],
+    code_spans: &[String],
 ) -> Completion {
     if let Some(completion) = todo_completion(line, cursor, todos) {
+        return completion;
+    }
+    if let Some(completion) = code_span_completion(line, cursor, code_spans) {
         return completion;
     }
     if let Some(completion) = history_completion(line, cursor, history) {
@@ -1416,18 +1662,84 @@ fn common_prefix(strings: &[String]) -> String {
 }
 
 #[cfg(test)]
+mod code_span_tests {
+    use super::{code_span_completion, code_spans_in};
+
+    #[test]
+    fn finds_inline_code_spans_but_not_fenced_blocks() {
+        let text = "A new `agent_selector_kind` function in `src/terminal.rs`.\n\
+                    ```\nlet `ignored` = 1;\n```\nAn `unclosed span";
+        assert_eq!(
+            code_spans_in(text),
+            ["agent_selector_kind", "src/terminal.rs"]
+        );
+    }
+
+    #[test]
+    fn tab_after_a_backtick_completes_and_closes_code_spans() {
+        let spans = [
+            "agent_selector_kind".to_owned(),
+            "agent_label_by_id".to_owned(),
+            "src/main.rs".to_owned(),
+            "agent_selector_kind".to_owned(),
+        ];
+        let line = "opus? what does `agent_sel";
+        let completion = code_span_completion(line, line.len(), &spans).unwrap();
+        assert_eq!(completion.start, line.len() - "agent_sel".len());
+        assert_eq!(completion.end, line.len());
+        assert_eq!(completion.matches, ["agent_selector_kind`"]);
+
+        let line = "opus? `agent";
+        let completion = code_span_completion(line, line.len(), &spans).unwrap();
+        assert_eq!(
+            completion.matches,
+            ["agent_selector_kind`", "agent_label_by_id`"]
+        );
+
+        // An existing closing backtick is replaced rather than doubled.
+        let line = "opus? `src`";
+        let completion = code_span_completion(line, line.len() - 1, &spans).unwrap();
+        assert_eq!(completion.end, line.len());
+        assert_eq!(completion.matches, ["src/main.rs`"]);
+
+        // Outside a span, or with no match, Tab falls back to other completion.
+        let line = "opus? `src/main.rs` agent";
+        assert!(code_span_completion(line, line.len(), &spans).is_none());
+        let line = "opus? `zzz";
+        assert!(code_span_completion(line, line.len(), &spans).is_none());
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::{
         backward_word, clear_editor, completions_in, forward_word, history_completion, kill,
-        normalize_paste, pi_model_selectors, prompt_for_display, selector_highlight, styled_input,
-        unknown_command_span_in, write_entered_input, write_input, write_notices,
-        write_statuses_with_width, write_title, write_wrapped, EditorDisplay, KillDirection,
-        SelectorKind,
+        normalize_paste, pi_model_selectors, selector_highlight, styled_input,
+        unknown_command_span_in, write_entered_input, write_entered_line_with_width, write_input,
+        write_input_style, write_notices, write_statuses_with_width, write_title, write_wrapped,
+        EditorDisplay, InputStyle, KillDirection, PromptView, ReferenceSource, SelectorKind,
     };
     use crate::session::DisplayDetail;
+    use std::collections::HashMap;
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn entered_line_reports_the_rows_to_move_up_to_relabel_it() {
+        let mut output = Vec::new();
+        assert_eq!(
+            write_entered_line_with_width(&mut output, "> + bash? git status", 10).unwrap(),
+            2
+        );
+        assert_eq!(output, b"> + bash? \r\ngit status\r\n");
+        let mut output = Vec::new();
+        assert_eq!(
+            write_entered_line_with_width(&mut output, "> ls", 10).unwrap(),
+            1
+        );
+        assert_eq!(output, b"> ls\r\n");
+    }
 
     #[test]
     fn pi_selectors_add_the_provider_only_for_clashing_ids() {
@@ -1454,14 +1766,15 @@ mod tests {
 
     #[test]
     fn expanded_prompt_has_no_deadline() {
-        assert_eq!(
-            prompt_for_display("short> ", "full/path> ", DisplayDetail::Compact),
-            "short> "
-        );
-        assert_eq!(
-            prompt_for_display("short> ", "full/path> ", DisplayDetail::Expanded),
-            "full/path> "
-        );
+        let view = |detail| PromptView {
+            prompt: "short> ",
+            full_prompt: "full/path> ",
+            detail,
+            color: false,
+            todos: &[],
+        };
+        assert_eq!(view(DisplayDetail::Compact).text(), "short> ");
+        assert_eq!(view(DisplayDetail::Expanded).text(), "full/path> ");
     }
 
     #[test]
@@ -1476,19 +1789,19 @@ mod tests {
     fn recognized_selectors_have_distinct_colors() {
         assert_eq!(
             selector_highlight("opus/luna? compare"),
-            Some((0, 10, SelectorKind::Agent))
+            Some((0, 10, SelectorKind::ReadOnlyAgent))
         );
         assert_eq!(
             selector_highlight("  fm! change this"),
-            Some((2, 5, SelectorKind::Agent))
+            Some((2, 5, SelectorKind::ReadWriteAgent))
         );
         assert_eq!(
             selector_highlight("codex! add LICENSE"),
-            Some((0, 6, SelectorKind::Agent))
+            Some((0, 6, SelectorKind::ReadWriteAgent))
         );
         assert_eq!(
             selector_highlight("pi.qwen3.5-9b? hello"),
-            Some((0, 14, SelectorKind::Agent))
+            Some((0, 14, SelectorKind::ReadOnlyAgent))
         );
         assert_eq!(selector_highlight("pi.qwen3.5-9b?? hello"), None);
         assert_eq!(
@@ -1514,46 +1827,58 @@ mod tests {
         assert_eq!(selector_highlight("unknown? inspect"), None);
         assert_eq!(
             selector_highlight("Opus? inspect"),
-            Some((0, 5, SelectorKind::Agent))
+            Some((0, 5, SelectorKind::ReadOnlyAgent))
         );
         assert_eq!(
             selector_highlight("opus?? inspect"),
-            Some((0, 6, SelectorKind::Agent))
+            Some((0, 6, SelectorKind::ReadOnlyAgent))
         );
         assert_eq!(
             selector_highlight("sol!!! inspect"),
-            Some((0, 6, SelectorKind::Agent))
+            Some((0, 6, SelectorKind::ReadWriteAgent))
         );
         assert_eq!(
             selector_highlight("opus/luna?? compare"),
-            Some((0, 11, SelectorKind::Agent))
+            Some((0, 11, SelectorKind::ReadOnlyAgent))
+        );
+        assert_eq!(
+            selector_highlight("opus! change"),
+            Some((0, 5, SelectorKind::ReadWriteAgent))
+        );
+        assert_eq!(
+            selector_highlight("opus?! change"),
+            Some((0, 6, SelectorKind::ReadWriteAgent))
+        );
+        assert_eq!(
+            selector_highlight("opus!! change"),
+            Some((0, 6, SelectorKind::ReadWriteAgent))
         );
         assert_eq!(selector_highlight("echo opus/luna?"), None);
         assert_eq!(selector_highlight("+bash! echo hi"), None);
         for emoji in ["🎵", "🎶", "🥧", "🍎"] {
             assert_eq!(
                 selector_highlight(&format!("{emoji} inspect this")),
-                Some((0, emoji.len(), SelectorKind::Agent))
+                Some((0, emoji.len(), SelectorKind::ReadOnlyAgent))
             );
         }
         assert_eq!(
             selector_highlight("☀️ inspect this"),
-            Some((0, "☀️".len(), SelectorKind::Agent))
+            Some((0, "☀️".len(), SelectorKind::ReadOnlyAgent))
         );
         assert_eq!(
             selector_highlight("🌙 inspect this"),
-            Some((0, "🌙".len(), SelectorKind::Agent))
+            Some((0, "🌙".len(), SelectorKind::ReadOnlyAgent))
         );
 
         let mut colored = Vec::new();
         write_input(&mut colored, "opus/luna? compare", true).unwrap();
-        assert_eq!(colored, b"\x1b[1;35mopus/luna?\x1b[0m compare");
+        assert_eq!(colored, b"\x1b[1;32mopus/luna?\x1b[0m compare");
         colored.clear();
         write_input(&mut colored, "+ bash? git status", true).unwrap();
-        assert_eq!(colored, b"+ \x1b[1;34mbash?\x1b[0m git status");
+        assert_eq!(colored, b"+ \x1b[1;32mbash?\x1b[0m git status");
         colored.clear();
         write_input(&mut colored, "+ HEAD https://example.com", true).unwrap();
-        assert_eq!(colored, b"+ \x1b[1;34mHEAD\x1b[0m https://example.com");
+        assert_eq!(colored, b"+ \x1b[1;32mHEAD\x1b[0m https://example.com");
         colored.clear();
         write_input(&mut colored, "bash! rm file", true).unwrap();
         assert_eq!(colored, b"\x1b[1;33mbash!\x1b[0m rm file");
@@ -1561,8 +1886,11 @@ mod tests {
         write_input(&mut colored, "@staffer opus? inspect", true).unwrap();
         assert_eq!(
             colored,
-            b"\x1b[1;34m@staffer\x1b[0m \x1b[1;35mopus?\x1b[0m inspect"
+            b"\x1b[1;32m@staffer\x1b[0m \x1b[1;32mopus?\x1b[0m inspect"
         );
+        colored.clear();
+        write_input(&mut colored, "opus! change", true).unwrap();
+        assert_eq!(colored, b"\x1b[1;35mopus!\x1b[0m change");
         let mut plain = Vec::new();
         write_input(&mut plain, "bash! rm file", false).unwrap();
         assert_eq!(plain, b"bash! rm file");
@@ -1572,11 +1900,11 @@ mod tests {
     fn help_examples_use_prompt_selector_colors() {
         assert_eq!(
             styled_input("  opus? task          Ask Opus", true),
-            "  \x1b[1;35mopus?\x1b[0m task          Ask Opus"
+            "  \x1b[1;32mopus?\x1b[0m task          Ask Opus"
         );
         assert_eq!(
             styled_input("  + bash? command     Watch as staffer", true),
-            "  + \x1b[1;34mbash?\x1b[0m command     Watch as staffer"
+            "  + \x1b[1;32mbash?\x1b[0m command     Watch as staffer"
         );
         assert_eq!(
             styled_input("  bash! command       Run Bash", true),
@@ -1589,18 +1917,32 @@ mod tests {
     fn entered_commands_and_agent_tasks_are_bold() {
         let mut output = Vec::new();
         write_entered_input(&mut output, "ls", true).unwrap();
-        assert_eq!(output, b"\x1b[1mls\x1b[0m");
+        assert_eq!(output, b"\x1b[1m\x1b[1;34mls\x1b[0m\x1b[1m\x1b[0m");
+        output.clear();
+        // Only the command name is blue; its arguments stay plain bold.
+        write_entered_input(&mut output, "  ls -la src", true).unwrap();
+        assert_eq!(
+            output,
+            b"\x1b[1m  \x1b[1;34mls\x1b[0m\x1b[1m -la src\x1b[0m"
+        );
+        output.clear();
+        write_entered_input(&mut output, "cd src", true).unwrap();
+        assert_eq!(output, b"\x1b[1m\x1b[1;34mcd\x1b[0m\x1b[1m src\x1b[0m");
+        output.clear();
+        // Notes have no command name to colour.
+        write_entered_input(&mut output, "# note", true).unwrap();
+        assert_eq!(output, b"\x1b[1m# note\x1b[0m");
         output.clear();
         write_entered_input(&mut output, "opus? inspect this", true).unwrap();
         assert_eq!(
             output,
-            b"\x1b[1m\x1b[1;35mopus?\x1b[0m\x1b[1m inspect this\x1b[0m"
+            b"\x1b[1m\x1b[1;32mopus?\x1b[0m\x1b[1m inspect this\x1b[0m"
         );
         output.clear();
         write_entered_input(&mut output, "@staffer opus? inspect", true).unwrap();
         assert_eq!(
             output,
-            b"\x1b[1m\x1b[1;34m@staffer\x1b[0m\x1b[1m \x1b[1;35mopus?\x1b[0m\x1b[1m inspect\x1b[0m"
+            b"\x1b[1m\x1b[1;32m@staffer\x1b[0m\x1b[1m \x1b[1;32mopus?\x1b[0m\x1b[1m inspect\x1b[0m"
         );
         output.clear();
         write_entered_input(&mut output, "ls", false).unwrap();
@@ -1624,23 +1966,48 @@ mod tests {
         output.clear();
         // `@staffer yes!` is rejected, so only `@staffer` is coloured.
         write_input(&mut output, "@staffer yes!", true).unwrap();
-        assert_eq!(output, b"\x1b[1;34m@staffer\x1b[0m yes!");
+        assert_eq!(output, b"\x1b[1;32m@staffer\x1b[0m yes!");
     }
 
     #[test]
     fn agent_prompts_colour_references() {
         assert_eq!(
             styled_input("opus? compare #3 with opus?#12, #4.2 and #1.", true),
-            "\x1b[1;35mopus?\x1b[0m compare \x1b[1;36m#3\x1b[0m with \
+            "\x1b[1;32mopus?\x1b[0m compare \x1b[1;36m#3\x1b[0m with \
              \x1b[1;36mopus?#12\x1b[0m, \x1b[1;36m#4.2\x1b[0m and \x1b[1;36m#1\x1b[0m."
         );
         // Escaped, hex-colour, zero-led and URL-fragment forms are not references.
         assert_eq!(
             styled_input(r"opus? not #\1, #123456, #01 or https://x.dev/#2", true),
-            "\x1b[1;35mopus?\x1b[0m not #\\1, #123456, #01 or https://x.dev/#2"
+            "\x1b[1;32mopus?\x1b[0m not #\\1, #123456, #01 or https://x.dev/#2"
         );
         // Shell commands keep their own reference handling and are not coloured.
         assert_eq!(styled_input("cat #3", true), "cat #3");
+    }
+
+    #[test]
+    fn references_take_their_source_colour() {
+        let references = HashMap::from([
+            (3, ReferenceSource::ReadOnlyAgent),
+            (6, ReferenceSource::ReadWriteAgent),
+            (4, ReferenceSource::Reader),
+            (7, ReferenceSource::Note),
+        ]);
+        let mut output = Vec::new();
+        write_input_style(
+            &mut output,
+            "opus? compare #3, opus?#3, #6, #4 and #4.2 with #5 per #7",
+            true,
+            InputStyle::Example,
+            &references,
+        )
+        .unwrap();
+        assert_eq!(
+            String::from_utf8(output).unwrap(),
+            "\x1b[1;32mopus?\x1b[0m compare \x1b[1;32m#3\x1b[0m, \x1b[1;32mopus?#3\x1b[0m, \
+             \x1b[1;35m#6\x1b[0m, \x1b[1;32m#4\x1b[0m and \x1b[1;32m#4.2\x1b[0m with \
+             \x1b[1;36m#5\x1b[0m per \x1b[1;90m#7\x1b[0m"
+        );
     }
 
     #[test]

@@ -277,7 +277,11 @@ pub enum Event {
         input: String,
         status: i32,
     },
-    Comment(String),
+    /// A `# note`, numbered like results so `#n` can refer to it.
+    Comment {
+        id: usize,
+        text: String,
+    },
     AgentRequest {
         id: usize,
         input: String,

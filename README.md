@@ -231,7 +231,7 @@ Lynn runs these commands directly, without an LLM:
 
 Lynn detects unquoted `&` and stops before running the line, with a suggestion to enter `zsh!` or `bash!`. Run background jobs inside that interactive shell, where `jobs`, `fg`, and `wait` share its job state. Directory changes, variables, and jobs belong to that shell; exiting returns to Lynn's own state. Quoted or escaped ampersands remain literal arguments. Explicit `bash! command` and `zsh! command` scripts are interpreted by their shell.
 
-At the interactive prompt, an unknown first command turns red as you type. Commands found in `PATH`, executable paths, and Lynn built-ins keep the normal color. For example, `opus` turns red if you meant to type `opus?`.
+At the interactive prompt, the first command word is colored as you type: blue for commands found in `PATH`, executable paths, and Lynn built-ins, and red for unknown commands. Arguments keep the normal color, so in `man hello` only `man` is blue. For example, `opus` turns red if you meant to type `opus?`.
 
 If a command contains `$(...)`, Lynn runs the full command through Bash or Zsh. Lynn uses `$SHELL` if it is Bash or Zsh. If not, Lynn uses Zsh on macOS and Bash on Linux. Built-in commands such as `cd` in this shell do not change the directory of Lynn.
 
@@ -297,7 +297,7 @@ Put `+` before `bash?`, `zsh?`, `HEAD`, or `FEED` to watch a command or URL:
 
 Enter `+` alone to run each watch again and show only added lines. Enter `+-` to show both added and removed lines. Unchanged lines are omitted. Each check compares with the previous `+` or `+-` check, or with the first result if you have not checked yet.
 
-Every watch, HTTP request, and agent request uses the same number sequence. A watch's first successful result is revision 1; Lynn adds another revision whenever its output changes. For example, `#3` shows watch #3's latest successful result, and `#3.2` shows its second revision. Agents can use the same references: `opus? What changed between #3.1 and #3.2?` A request for a watch still loading waits for its first result. Repeating the same `+` command keeps the existing watch number; enter `+` to refresh it. Watch revisions last until `reset` or exit.
+A new watch's number appears in green at the end of the line you typed, as in `+ bash? git status  #79`. If other output has already appeared below that line, or input isn't from a terminal, Lynn prints `[watch #79 loading] ...` instead. Every watch, HTTP request, and agent request uses the same number sequence. A watch's first successful result is revision 1; Lynn adds another revision whenever its output changes. For example, `#3` shows watch #3's latest successful result, and `#3.2` shows its second revision. Agents can use the same references: `opus? What changed between #3.1 and #3.2?` A request for a watch still loading waits for its first result. Repeating the same `+` command keeps the existing watch number; enter `+` to refresh it. Watch revisions last until `reset` or exit.
 
 Numbered HTTP results, such as `[head #2]`, can also be referenced in an agent request with `#2`.
 
@@ -307,20 +307,20 @@ In a fresh Lynn session, write down the goal, create the crate, and watch recent
 
 ```text
 # I want to make a base64 encoder in Rust
+[note #1]
 cargo new --lib mini-base64
 cd mini-base64
-+ FEED https://static.crates.io/rss/updates.xml
-[watch #1 loading] + FEED https://static.crates.io/rss/updates.xml
-[watch #1.1 + FEED https://static.crates.io/rss/updates.xml] New crate version published: ...
++ FEED https://static.crates.io/rss/updates.xml  #2
+[watch #2.1 + FEED https://static.crates.io/rss/updates.xml] New crate version published: ...
 opus? Research the features a small Base64 Rust crate should support. Suggest a public API and test cases for standard and URL-safe encoding.
-opus?#2: Support both alphabets, specify padding behavior, and test RFC 4648 vectors plus empty and non-ASCII bytes.
-pi! Implement the API and tests proposed in #2, with documentation for standard and URL-safe encoding.
-pi!#3: Added standard and URL-safe encoders, padding options, documentation, and test vectors.
-luna? Review #3, src/lib.rs, and the tests for correctness and API clarity before publishing.
-luna?#4: The encoders and tests cover the key cases; check the package metadata before publishing.
+opus?#3: Support both alphabets, specify padding behavior, and test RFC 4648 vectors plus empty and non-ASCII bytes.
+pi! Implement the API and tests proposed in #3, with documentation for standard and URL-safe encoding. Keep to #1: an encoder only.
+pi!#4: Added standard and URL-safe encoders, padding options, documentation, and test vectors.
+luna? Review #4, src/lib.rs, and the tests for correctness and API clarity before publishing.
+luna?#5: The encoders and tests cover the key cases; check the package metadata before publishing.
 ```
 
-The first `#` line is a note shared with all agents. The feed is `#1`, Opus's research is `#2`, and Pi's implementation is `#3`. You can send Luna's review request while Pi is still working; referring to `#3` queues it until Pi's result arrives. After you review the code, address Luna's feedback, choose an available crate name, and fill in the crate's metadata, you run the publication commands yourself:
+The first `#` line is note `#1`, shared with all agents. The feed is `#2`, Opus's research is `#3`, and Pi's implementation is `#4`. You can send Luna's review request while Pi is still working; referring to `#4` queues it until Pi's result arrives. After you review the code, address Luna's feedback, choose an available crate name, and fill in the crate's metadata, you run the publication commands yourself:
 
 ```text
 cargo test
@@ -332,7 +332,7 @@ cargo publish
 
 Lynn keeps these items in the session, and agents can see them:
 
-- Comments that start with `#`.
+- Notes that start with `#`. Each note gets a number, shown as `[note #n]`, so you can point an agent at it with `#n`. Entering `#n` alone shows the note again. References to notes are grey.
 - Todos that start with `- [ ]`. Enter `- [x] ` and press Tab to complete an unfinished todo, then press Enter to check it off. You can also type the exact todo text directly.
 - Web pages. Enter an HTTP or HTTPS URL to load the page in the background. Lynn keeps up to 4 MiB of each page in memory. Agents get a part of the page. To give an agent the whole page, put the URL in the request, as in `opus? summarize https://...`. Lynn loads the page first, or reuses the copy it already has, and then sends the request.
 
@@ -366,11 +366,12 @@ Colors help you see the access level before you press Enter:
 | Color | Input |
 | --- | --- |
 | Cyan | The prompt |
-| Magenta | Agent requests, for example `opus/luna?` and `codex!`, and the `fm?` mode label |
-| Blue | Commands as `staffer`: `bash?`, `zsh?`, and `@staffer` |
+| Magenta | Read-write agent requests, for example `opus!`, `codex!!` and `opus?!`, and `yes` replies |
+| Green | Read-only agent requests, for example `opus/luna?` and `opus??`, the `fm?` mode label, and commands as `staffer`: `bash?`, `zsh?`, and `@staffer` |
 | Yellow | Commands as you through a shell: `bash!` and `zsh!` |
+| Blue | Known commands at the shell prompt, for example `brew` in `brew install git` (unknown ones are red) |
 
-Entered commands and agent requests appear in bold, while selector colors still show their access level. Expanded agent results show the original request in bold. Watched commands, for example `+ bash?`, use the same colors. Agent answers color the reply label, Markdown bold text, bullet marks, and inline code. To remove the colors, set `NO_COLOR=1`.
+Entered commands and agent requests appear in bold, while selector colors still show their access level. Expanded agent results show the original request in bold. Watched commands, for example `+ bash?`, use the same colors. A `#n` reference in an agent request takes the color of what it points to: green for a read-only agent reply or a `+ bash?`, `HEAD` or `FEED` result, magenta for a read-write agent reply, grey for a `#` note, and cyan for anything else, such as a loaded URL or a number not yet in the session. Agent answers color the reply label (green for read-only, magenta for read-write), and running or queued requests color theirs the same way, for example `opus?#2: …`. Answers also color Markdown bold text, bullet marks, and inline code. To remove the colors, set `NO_COLOR=1`.
 
 Editing keys:
 
@@ -387,7 +388,7 @@ Editing keys:
 | Ctrl-C | Cancel the current line |
 | Ctrl-D | Exit Lynn (at an empty prompt) |
 
-Tab completion accepts relative paths, absolute paths, and paths that start with `~/`. It adds escapes to spaces in names. Lynn also shows suggestions from your history as you type.
+Tab completion accepts relative paths, absolute paths, and paths that start with `~/`. It adds escapes to spaces in names. After an opening backtick, Tab completes `code` from the last three agent answers and adds the closing backtick, so `` `agent_sel `` becomes `` `agent_selector_kind` ``. Lynn also shows suggestions from your history as you type.
 
 Type `!` at an empty prompt and press Tab to recall the last command if it was a read-only agent request. For example, `opus? explain this` becomes `opus! explain this`, preserving the instruction. Repeated question marks become matching exclamation marks (`sol??` becomes `sol!!`). The recalled request stays in the editor until you press Enter. This shortcut uses only the most recent command and applies to requests for a single agent.
 
