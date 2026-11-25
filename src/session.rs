@@ -15,6 +15,9 @@ pub struct Session {
     pub mode: PromptMode,
     pub detail: DisplayDetail,
     pub expanded_response_ids: BTreeSet<usize>,
+    /// How many events ↓ has already replayed, so the next replay carries on
+    /// from there.
+    pub replayed_events: usize,
     /// The Pi model from the latest `pi.<model>?`, used by `pi?` and `pi!`.
     pub pi_model: Option<String>,
 }
@@ -276,6 +279,8 @@ pub enum Event {
     Command {
         input: String,
         status: i32,
+        /// When the command started, for showing how long ago in the ↓ replay.
+        ran_at: Instant,
     },
     /// A `# note`, numbered like results so `#n` can refer to it.
     Comment {
@@ -381,6 +386,7 @@ impl Session {
             mode: PromptMode::Shell,
             detail: DisplayDetail::Compact,
             expanded_response_ids: BTreeSet::new(),
+            replayed_events: 0,
             pi_model: None,
         })
     }

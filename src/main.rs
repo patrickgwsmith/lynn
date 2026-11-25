@@ -310,36 +310,114 @@ fn emphasize_prompt(prompt: &str, color: bool) -> String {
     }
 }
 
+/// What ↓ prints: everything since the last replay, in the order it happened,
+/// so agent replies come back with their full prompts alongside the shell
+/// commands and notes around them, never on their own. Lynn doesn't keep
+/// command output, so commands show what was typed and any failing status.
+/// Prints nothing unless there is a reply not yet expanded, and then keeps
+/// the commands for the next replay, so a replay is never just repeated
+/// commands.
 fn expanded_agent_results(session: &mut Session) -> Vec<String> {
-    let results: Vec<_> = session
-        .events
-        .iter()
-        .filter_map(|event| match event {
+    let start = session.replayed_events.min(session.events.len());
+    let has_new_reply = session.events[start..].iter().any(|event| {
+        matches!(event, Event::AgentResponse { id, .. } if !session.expanded_response_ids.contains(id))
+    });
+    if !has_new_reply {
+        return Vec::new();
+    }
+    let color = output_color();
+    let mut results = Vec::new();
+    let mut expanded = Vec::new();
+    for event in &session.events[start..] {
+        match event {
+            Event::Command {
+                input,
+                status,
+                ran_at,
+            } => {
+                results.push(replayed_command(input, *status, ran_at.elapsed(), color));
+            }
+            Event::Comment { id, text } => {
+                results.push(dim(&format!("note#{id}: {text}"), color));
+            }
             Event::AgentResponse {
                 id, model, text, ..
             } if !session.expanded_response_ids.contains(id) => {
-                let label = agent_label_by_id(session, *id)?;
-                Some((
-                    *id,
-                    render_session_agent(
+                if let Some(label) = agent_label_by_id(session, *id) {
+                    expanded.push(*id);
+                    results.push(render_session_agent(
                         session,
                         AgentLabel { model, ..label },
                         AgentDisplay::FullAnswer(text),
                         PromptLine::Always,
-                    ),
-                ))
+                    ));
+                }
             }
-            _ => None,
-        })
-        .collect();
-    for (id, _) in &results {
-        session.expanded_response_ids.insert(*id);
+            _ => {}
+        }
     }
-    results.into_iter().map(|(_, result)| result).collect()
+    session.expanded_response_ids.extend(expanded);
+    session.replayed_events = session.events.len();
+    results
+}
+
+/// A shell command in the ↓ replay, such as `$ ls -d src [18m ago]` or
+/// `$ false [exit 1, 18m ago]`, dimmed so replies stand out.
+fn replayed_command(input: &str, status: i32, age: Duration, color: bool) -> String {
+    let ago = format_ago(age);
+    let line = if status == 0 {
+        format!("$ {input} [{ago}]")
+    } else {
+        format!("$ {input} [exit {status}, {ago}]")
+    };
+    dim(&line, color)
+}
+
+fn dim(text: &str, color: bool) -> String {
+    if color {
+        format!("\x1b[2m{text}\x1b[0m")
+    } else {
+        text.to_owned()
+    }
 }
 
 fn pending_agent_statuses(session: &Session, workers: &Workers, color: bool) -> Vec<String> {
-    pending_agent_statuses_with_width(session, workers, color, terminal::columns())
+    pending_agent_statuses_with_width(
+        session,
+        workers,
+        color,
+        terminal::columns(),
+        activity_frame(),
+    )
+}
+
+/// How often the activity dots on a pending prompt line change. The editor
+/// rechecks status lines this often while any are shown.
+const ACTIVITY_INTERVAL: Duration = terminal::STATUS_TICK;
+
+/// Dots that cycle after a revealed prompt, such as `sol!#13: well save it ··`,
+/// so a quiet request still looks alive. All are the same width so the line
+/// doesn't jump.
+const ACTIVITY_FRAMES: [&str; 4] = ["   ", "·  ", "·· ", "···"];
+
+/// Columns the activity dots take, including the space before them.
+const ACTIVITY_WIDTH: usize = 4;
+
+/// The current activity frame, counted from when Lynn started so every
+/// pending line moves together.
+fn activity_frame() -> usize {
+    static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    let elapsed = START.get_or_init(Instant::now).elapsed();
+    (elapsed.as_millis() / ACTIVITY_INTERVAL.as_millis()) as usize
+}
+
+fn activity_dots(frame: usize, color: bool) -> String {
+    let dots = ACTIVITY_FRAMES[frame % ACTIVITY_FRAMES.len()];
+    if color {
+        format!(" \x1b[2m{dots}\x1b[0m")
+    } else {
+        format!(" {dots}")
+    }
 }
 
 /// Status lines for pending agents and loads. Expanded detail shows every
@@ -352,6 +430,7 @@ fn pending_agent_statuses_with_width(
     workers: &Workers,
     color: bool,
     columns: usize,
+    frame: usize,
 ) -> Vec<String> {
     let mut statuses = Vec::new();
     for (&id, status) in &workers.pending_agents {
@@ -361,18 +440,21 @@ fn pending_agent_statuses_with_width(
             .get(&id)
             .filter(|prompt| prompt.shown);
         // A bare `opus!#28: …` says nothing, so the prompt takes its place
-        // on one line instead of adding a second.
+        // on one line instead of adding a second, with cycling dots in place
+        // of the `…` to show it is still working.
         if let (false, Some(prompt), Some(label)) =
             (expanded, pending_prompt, status.strip_suffix(": …"))
         {
             if let Some(input) = request_input(session, id) {
                 let prefix = format!("{label}: ");
                 let text = prompt.summary.as_deref().unwrap_or(input);
-                let text = one_line_prompt(text, prompt_room(&prefix, columns));
+                let room = prompt_room(&prefix, columns).saturating_sub(ACTIVITY_WIDTH);
+                let text = one_line_prompt(text, room);
                 statuses.push(format!(
-                    "{}{}",
+                    "{}{}{}",
                     color_status_label(session, id, &prefix, color),
-                    emphasize_prompt(&text, color)
+                    emphasize_prompt(&text, color),
+                    activity_dots(frame, color)
                 ));
                 continue;
             }
@@ -725,7 +807,7 @@ fn main() {
             let full_prompt = prompt(session.mode, &session.cwd, true, color);
             let statuses = pending_agent_statuses(&session, &workers, color);
             let todos = session.todos.clone();
-            terminal.set_references(reference_sources(&session));
+            terminal.set_references(reference_sources(&session, &workers));
             terminal.set_code_spans(recent_code_spans(&session));
             let line = match terminal.read_line(
                 terminal::PromptView {
@@ -978,6 +1060,7 @@ fn handle(
                     return None;
                 }
             };
+            let ran_at = Instant::now();
             let outcome = if inline::shell_substitution(&resolved) {
                 shell::execute_substitution_shell(&resolved).map(Outcome::Status)
             } else {
@@ -1004,9 +1087,11 @@ fn handle(
             session.events.push(Event::Command {
                 input: command.into(),
                 status,
+                ran_at,
             });
         }
         Input::InteractiveShell(program) => {
+            let ran_at = Instant::now();
             let status = match shell::enter_interactive(program) {
                 Ok(status) => status,
                 Err(error) => {
@@ -1018,6 +1103,7 @@ fn handle(
             session.events.push(Event::Command {
                 input: format!("{program}!"),
                 status,
+                ran_at,
             });
         }
         Input::HostShell {
@@ -1025,6 +1111,7 @@ fn handle(
             command,
             execution,
         } => {
+            let ran_at = Instant::now();
             let status = match shell::execute_host_shell(program, command, execution) {
                 Ok(status) => status,
                 Err(error) => {
@@ -1036,6 +1123,7 @@ fn handle(
             session.events.push(Event::Command {
                 input: format!("{program}{} {command}", execution.suffix()),
                 status,
+                ran_at,
             });
         }
         Input::Comment(comment) => {
@@ -1375,6 +1463,7 @@ fn start_interactive_agent(
         access.description()
     );
     let _ = io::stdout().flush();
+    let ran_at = Instant::now();
     let status = match interactive_agent(
         model,
         session.pi_model.as_deref(),
@@ -1392,6 +1481,7 @@ fn start_interactive_agent(
     session.events.push(Event::Command {
         input: selector,
         status,
+        ran_at,
     });
 }
 
@@ -2251,7 +2341,7 @@ fn session_context_filtered(
         _ => true,
     }) {
         match event {
-            Event::Command { input, status } => {
+            Event::Command { input, status, .. } => {
                 context.push_str(&format!("command: {input} (exit {status})\n"))
             }
             Event::Comment { id, text } => context.push_str(&format!("comment (#{id}): {text}\n")),
@@ -2437,7 +2527,11 @@ fn latest_agent_response(session: &Session) -> Option<(AgentLabel<'_>, &str)> {
 }
 
 /// Where each numbered entry came from, so a typed `#n` takes its source's colour.
-fn reference_sources(session: &Session) -> HashMap<usize, terminal::ReferenceSource> {
+/// Numbers missing from the map are unknown and show red.
+fn reference_sources(
+    session: &Session,
+    workers: &Workers,
+) -> HashMap<usize, terminal::ReferenceSource> {
     let mut sources: HashMap<_, _> = session
         .events
         .iter()
@@ -2454,10 +2548,17 @@ fn reference_sources(session: &Session) -> HashMap<usize, terminal::ReferenceSou
             )),
             // `HEAD` is a reader selector; plain URL loads have none and stay cyan.
             Event::HttpHead { id, .. } => Some((*id, terminal::ReferenceSource::Reader)),
+            Event::Resource { id, .. } => Some((*id, terminal::ReferenceSource::Plain)),
             Event::Comment { id, .. } => Some((*id, terminal::ReferenceSource::Note)),
             _ => None,
         })
         .collect();
+    // A fetch still loading has its number already, so it is not unknown.
+    for id in workers.pending_http.keys() {
+        sources
+            .entry(*id)
+            .or_insert(terminal::ReferenceSource::Plain);
+    }
     for watch in &session.live_commands {
         sources.insert(watch.id, terminal::ReferenceSource::Reader);
     }
@@ -3138,9 +3239,10 @@ mod tests {
         assert!(!context.contains("prefer the smaller fix"));
         assert!(session_context(&session).contains("comment (#4): prefer the smaller fix\n"));
         assert_eq!(
-            super::reference_sources(&session).get(&4),
+            super::reference_sources(&session, &workers).get(&4),
             Some(&crate::terminal::ReferenceSource::Note)
         );
+        assert_eq!(super::reference_sources(&session, &workers).get(&5), None);
         assert!(super::ready_references("opus? follow #5", &session, &workers).is_err());
     }
 
@@ -3176,6 +3278,7 @@ mod tests {
             session.events.push(Event::Command {
                 input: format!("command-{number}"),
                 status: 0,
+                ran_at: Instant::now(),
             });
         }
         session.events.push(note(91, "Latest instruction"));
@@ -3456,7 +3559,7 @@ mod tests {
         // Before the reveal delay, no prompt line is shown.
         workers.pending_prompts.insert(4, Default::default());
         assert_eq!(
-            super::pending_agent_statuses_with_width(&session, &workers, false, 80)[0],
+            super::pending_agent_statuses_with_width(&session, &workers, false, 80, 3)[0],
             "opus!#4: Edit: src/main.rs"
         );
         // A summary arriving early still waits for the delay.
@@ -3469,7 +3572,7 @@ mod tests {
             &mut workers,
         );
         assert_eq!(
-            super::pending_agent_statuses_with_width(&session, &workers, false, 80).len(),
+            super::pending_agent_statuses_with_width(&session, &workers, false, 80, 3).len(),
             3
         );
         let summary = workers.pending_prompts.get_mut(&4).unwrap().summary.take();
@@ -3489,7 +3592,7 @@ mod tests {
         // Without a summary yet, the prompt line comes from the first line;
         // later lines become `…`. Requests not yet revealed get none.
         assert_eq!(
-            super::pending_agent_statuses_with_width(&session, &workers, false, 80),
+            super::pending_agent_statuses_with_width(&session, &workers, false, 80, 3),
             [
                 "opus!#4 prompt: Implement cancellation…",
                 "opus!#4: Edit: src/main.rs",
@@ -3499,13 +3602,13 @@ mod tests {
         );
         // A long first line is cut so the prompt never wraps.
         assert_eq!(
-            super::pending_agent_statuses_with_width(&session, &workers, false, 30)[0],
+            super::pending_agent_statuses_with_width(&session, &workers, false, 30, 3)[0],
             "opus!#4 prompt: Implement ca…"
         );
         // Once fm's summary arrives it replaces the first line, still cut to fit.
         workers.pending_prompts.get_mut(&4).unwrap().summary = summary;
         assert_eq!(
-            super::pending_agent_statuses_with_width(&session, &workers, false, 80)[0],
+            super::pending_agent_statuses_with_width(&session, &workers, false, 80, 3)[0],
             "opus!#4 prompt: Add cancellation, keep labels"
         );
         // A queued `!` request gets its own prompt line once revealed, but a
@@ -3517,7 +3620,7 @@ mod tests {
             &mut workers,
         );
         assert_eq!(
-            super::pending_agent_statuses_with_width(&session, &workers, false, 80),
+            super::pending_agent_statuses_with_width(&session, &workers, false, 80, 3),
             [
                 "opus!#4 prompt: Add cancellation, keep labels",
                 "opus!#4: Edit: src/main.rs",
@@ -3530,7 +3633,7 @@ mod tests {
         // fm's summary.
         session.detail = DisplayDetail::Expanded;
         assert_eq!(
-            super::pending_agent_statuses_with_width(&session, &workers, false, 30)[..2],
+            super::pending_agent_statuses_with_width(&session, &workers, false, 30, 3)[..2],
             [
                 "opus!#4 prompt [just now]: Implement cancellation\nPreserve existing labels",
                 "opus!#4: Edit: src/main.rs",
@@ -3538,7 +3641,7 @@ mod tests {
         );
         session.detail = DisplayDetail::Compact;
         assert_eq!(
-            super::pending_agent_statuses_with_width(&session, &workers, false, 30)[0],
+            super::pending_agent_statuses_with_width(&session, &workers, false, 30, 3)[0],
             "opus!#4 prompt: Add cancella…"
         );
         // Finishing a request drops its prompt line.
@@ -3555,27 +3658,32 @@ mod tests {
         );
         assert!(!workers.pending_prompts.contains_key(&4));
         // A revealed prompt replaces a bare `…` status on the same line, in
-        // compact detail only.
+        // compact detail only, with cycling dots that keep the same width so
+        // the line still fits.
         workers.pending_agents.insert(5, "opus!#5: …".into());
         assert_eq!(
-            super::pending_agent_statuses_with_width(&session, &workers, false, 80),
-            ["opus!#5: Update the tests", "opus?#6: …"]
+            super::pending_agent_statuses_with_width(&session, &workers, false, 80, 3),
+            ["opus!#5: Update the tests ···", "opus?#6: …"]
         );
         assert_eq!(
-            super::pending_agent_statuses_with_width(&session, &workers, false, 20)[0],
-            "opus!#5: Update th…"
+            super::pending_agent_statuses_with_width(&session, &workers, false, 80, 5)[0],
+            "opus!#5: Update the tests ·  "
+        );
+        assert_eq!(
+            super::pending_agent_statuses_with_width(&session, &workers, false, 20, 3)[0],
+            "opus!#5: Updat… ···"
         );
         // With colour, labels match answer labels: magenta for `!`, green for `?`.
         assert_eq!(
-            super::pending_agent_statuses_with_width(&session, &workers, true, 80),
+            super::pending_agent_statuses_with_width(&session, &workers, true, 80, 3),
             [
-                "\x1b[1;35mopus!#5:\x1b[0m \x1b[1mUpdate the tests\x1b[0m",
+                "\x1b[1;35mopus!#5:\x1b[0m \x1b[1mUpdate the tests\x1b[0m \x1b[2m···\x1b[0m",
                 "\x1b[1;32mopus?#6:\x1b[0m …"
             ]
         );
         session.detail = DisplayDetail::Expanded;
         assert_eq!(
-            super::pending_agent_statuses_with_width(&session, &workers, false, 80)[..2],
+            super::pending_agent_statuses_with_width(&session, &workers, false, 80, 3)[..2],
             ["opus!#5 prompt [just now]: Update the tests", "opus!#5: …"]
         );
         session.detail = DisplayDetail::Compact;
@@ -4341,6 +4449,67 @@ mod tests {
             expanded_agent_results(&mut session),
             ["luna?#2 prompt [just now]: Check the tests\nluna?#2 [0.0s]: Tests pass"]
         );
+    }
+
+    #[test]
+    fn down_replays_commands_and_notes_in_order_with_replies() {
+        let mut session = Session::new().unwrap();
+        session.events.push(Event::Command {
+            input: "ls -d src".into(),
+            status: 0,
+            ran_at: Instant::now() - Duration::from_secs(18 * 60 + 5),
+        });
+        session.events.push(Event::AgentRequest {
+            sent_at: Instant::now(),
+            id: 1,
+            input: "Inspect the parser".into(),
+            access: AgentAccess::ReadOnly,
+            user: AgentUser::Current,
+            model: Some("opus".into()),
+            effort: ReasoningEffort::Default,
+            output: AgentOutput::Final,
+            pi_model: None,
+        });
+        session.events.push(Event::Command {
+            input: "false".into(),
+            status: 1,
+            ran_at: Instant::now() - Duration::from_secs(125 * 60),
+        });
+        session.events.push(Event::Comment {
+            id: 2,
+            text: "keep it small".into(),
+        });
+        // Commands alone are not replayed, but are kept for the next replay.
+        assert!(expanded_agent_results(&mut session).is_empty());
+        session.events.push(Event::AgentResponse {
+            id: 1,
+            model: "opus".into(),
+            text: "Looks sound".into(),
+            model_info: None,
+            elapsed: None,
+        });
+        session.events.push(Event::Command {
+            input: "git status".into(),
+            status: 0,
+            ran_at: Instant::now(),
+        });
+        assert_eq!(
+            expanded_agent_results(&mut session),
+            [
+                "$ ls -d src [18m ago]",
+                "$ false [exit 1, 2h 05m ago]",
+                "note#2: keep it small",
+                "opus?#1 prompt [just now]: Inspect the parser\nopus?#1: Looks sound",
+                "$ git status [just now]",
+            ]
+        );
+        // The next replay carries on after what was already replayed.
+        session.events.push(Event::Command {
+            input: "cargo test".into(),
+            status: 0,
+            ran_at: Instant::now(),
+        });
+        assert!(expanded_agent_results(&mut session).is_empty());
     }
 
     #[test]

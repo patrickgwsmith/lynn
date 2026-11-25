@@ -17,11 +17,10 @@ pub fn run(request: Request<'_>) -> Result<AgentReply, String> {
     };
     let task = agent_cli::request_for_access(request.task, request.access);
     let input = agent_cli::session_input(request.context, &format!("{task}\n\n{instruction}"));
-    if request.access == AgentAccess::ReadOnly {
-        // Headless agy denies any command not allowed here and then ends the
-        // turn with no answer, so let agy? run the usual read-only commands.
-        command.args(["--settings", &read_only_settings()]);
-    }
+    // Headless agy denies any command not allowed here and then ends the turn
+    // with no answer, so let agy? run the usual read-only commands and agy!
+    // run any command, as claude! and codex! can.
+    command.args(["--settings", &permission_settings(request.access)]);
     // agy's print mode takes its prompt as the flag's value, not from stdin.
     command.args([
         "--output-format",
@@ -30,7 +29,7 @@ pub fn run(request: Request<'_>) -> Result<AgentReply, String> {
         &format!("--print={input}"),
     ]);
     let output = command.output().map_err(|error| format!("agy: {error}"))?;
-    let reply = parse_result(&output.stdout, request.model);
+    let reply = parse_result(&output.stdout, request.model, request.access);
     if !output.status.success() {
         let detail = match reply {
             Err(error) if output.stdout.is_empty() => {
@@ -111,15 +110,22 @@ const READ_ONLY_COMMANDS: &[&str] = &[
     "git rev-parse",
 ];
 
-fn read_only_settings() -> String {
-    let allow: Vec<String> = READ_ONLY_COMMANDS
-        .iter()
-        .map(|command| format!("command({command})"))
-        .collect();
+fn permission_settings(access: AgentAccess) -> String {
+    let allow: Vec<String> = match access {
+        AgentAccess::ReadOnly => READ_ONLY_COMMANDS
+            .iter()
+            .map(|command| format!("command({command})"))
+            .collect(),
+        AgentAccess::ReadWrite => vec!["command(*)".to_owned()],
+    };
     serde_json::json!({ "permissions": { "allow": allow } }).to_string()
 }
 
-fn parse_result(output: &[u8], requested: Option<&str>) -> Result<AgentReply, String> {
+fn parse_result(
+    output: &[u8],
+    requested: Option<&str>,
+    access: AgentAccess,
+) -> Result<AgentReply, String> {
     let value: serde_json::Value = serde_json::from_slice(output)
         .map_err(|error| format!("agy returned invalid JSON: {error}"))?;
     if value["status"].as_str() == Some("ERROR") {
@@ -132,7 +138,7 @@ fn parse_result(output: &[u8], requested: Option<&str>) -> Result<AgentReply, St
     let answer = value["response"]
         .as_str()
         .filter(|text| !text.trim().is_empty())
-        .ok_or_else(|| empty_answer_error(&value))?;
+        .ok_or_else(|| empty_answer_error(&value, access))?;
     let model = value["model"].as_str().map(|model| {
         model
             .chars()
@@ -154,7 +160,7 @@ fn parse_result(output: &[u8], requested: Option<&str>) -> Result<AgentReply, St
 
 /// Headless agy denies actions it would have asked about, then ends the turn
 /// reporting success with an empty response and a `denied_actions` list.
-fn empty_answer_error(value: &serde_json::Value) -> String {
+fn empty_answer_error(value: &serde_json::Value, access: AgentAccess) -> String {
     let mut denied: Vec<&str> = value["denied_actions"]
         .as_array()
         .into_iter()
@@ -167,10 +173,15 @@ fn empty_answer_error(value: &serde_json::Value) -> String {
     }
     let actions = denied.join(", ");
     if denied == ["command"] {
-        format!(
-            "agy stopped: it tried to run a command outside agy?'s allow-list ({}), which headless mode denies",
-            READ_ONLY_COMMANDS.join(", ")
-        )
+        match access {
+            AgentAccess::ReadOnly => format!(
+                "agy stopped: it tried to run a command outside agy?'s allow-list ({}), which headless mode denies",
+                READ_ONLY_COMMANDS.join(", ")
+            ),
+            // agy! allows every command, so only agy's own policy, such as an
+            // organization's review rule, can have denied it.
+            AgentAccess::ReadWrite => "agy stopped: headless mode denied a command it tried to run, despite agy!'s allow-all rule; an agy or organization policy may require approval for it".to_owned(),
+        }
     } else {
         format!("agy stopped: headless mode denied an action it tried ({actions})")
     }
@@ -180,16 +191,20 @@ fn empty_answer_error(value: &serde_json::Value) -> String {
 mod tests {
     use super::*;
 
+    fn parse(output: &[u8], requested: Option<&str>) -> Result<AgentReply, String> {
+        parse_result(output, requested, AgentAccess::ReadOnly)
+    }
+
     #[test]
     fn returns_the_response_and_any_reported_model() {
-        let reply = parse_result(
+        let reply = parse(
             br#"{"conversation_id":"c","status":"SUCCESS","response":" Done\n","num_turns":1}"#,
             None,
         )
         .unwrap();
         assert_eq!(reply.text, "Done");
         assert_eq!(reply.model_info, Some(ModelInfo::Unreported));
-        let reply = parse_result(
+        let reply = parse(
             br#"{"status":"SUCCESS","response":"Done","model":"gemini"}"#,
             Some("gemini-3.8-flash-high"),
         )
@@ -198,7 +213,7 @@ mod tests {
             reply.model_info,
             Some(ModelInfo::Reported(vec!["gemini".into()]))
         );
-        let reply = parse_result(
+        let reply = parse(
             br#"{"status":"SUCCESS","response":"Done"}"#,
             Some("gemini-3.8-flash-high"),
         )
@@ -211,19 +226,19 @@ mod tests {
 
     #[test]
     fn rejects_errors_and_empty_answers() {
-        let error = parse_result(
+        let error = parse(
             br#"{"conversation_id":"","status":"ERROR","response":"","error":"authentication failed or timed out"}"#,
             None,
         )
         .unwrap_err();
         assert_eq!(error, "authentication failed or timed out");
-        assert!(parse_result(br#"{"status":"SUCCESS","response":"  "}"#, None).is_err());
-        assert!(parse_result(b"not JSON", None).is_err());
+        assert!(parse(br#"{"status":"SUCCESS","response":"  "}"#, None).is_err());
+        assert!(parse(b"not JSON", None).is_err());
         assert_eq!(
-            parse_result(br#"{"status":"SUCCESS","response":""}"#, None).unwrap_err(),
+            parse(br#"{"status":"SUCCESS","response":""}"#, None).unwrap_err(),
             "agy returned no answer"
         );
-        let error = parse_result(
+        let error = parse(
             br#"{"status":"SUCCESS","response":"","denied_actions":[{"action":"command","display_name":"RunCommand"}]}"#,
             None,
         )
@@ -234,6 +249,17 @@ mod tests {
         );
         assert!(error.contains("rg, grep"), "{error}");
         let error = parse_result(
+            br#"{"status":"SUCCESS","response":"","denied_actions":[{"action":"command"}]}"#,
+            None,
+            AgentAccess::ReadWrite,
+        )
+        .unwrap_err();
+        assert!(
+            error.starts_with("agy stopped: headless mode denied a command"),
+            "{error}"
+        );
+        assert!(!error.contains("agy?"), "{error}");
+        let error = parse(
             br#"{"status":"SUCCESS","response":"","denied_actions":[{"action":"mcp"}]}"#,
             None,
         )
@@ -245,11 +271,17 @@ mod tests {
     }
 
     #[test]
-    fn read_only_settings_allow_read_only_commands() {
-        let settings: serde_json::Value = serde_json::from_str(&read_only_settings()).unwrap();
-        let allow = settings["permissions"]["allow"].as_array().unwrap();
-        assert!(allow.contains(&"command(rg)".into()));
-        assert!(allow.contains(&"command(git log)".into()));
+    fn settings_allow_read_only_commands_or_every_command() {
+        let allow = |access| {
+            let settings: serde_json::Value =
+                serde_json::from_str(&permission_settings(access)).unwrap();
+            settings["permissions"]["allow"].as_array().unwrap().clone()
+        };
+        let read = allow(AgentAccess::ReadOnly);
+        assert!(read.contains(&"command(rg)".into()));
+        assert!(read.contains(&"command(git log)".into()));
+        assert!(!read.contains(&"command(*)".into()));
+        assert_eq!(allow(AgentAccess::ReadWrite), ["command(*)"]);
     }
 
     #[test]

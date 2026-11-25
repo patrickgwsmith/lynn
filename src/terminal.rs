@@ -77,6 +77,8 @@ pub enum ReferenceSource {
     Reader,
     /// A `# note`.
     Note,
+    /// An entry with no selector, such as a plain URL load.
+    Plain,
 }
 
 /// What the editor shows before the input and what Tab can complete from it.
@@ -189,7 +191,7 @@ impl Terminal {
         Ok(true)
     }
 
-    /// Set which source each `#n` refers to; unknown numbers keep the plain reference colour.
+    /// Set which source each `#n` refers to; numbers not in the map are unknown and show red.
     pub fn set_references(&mut self, references: HashMap<usize, ReferenceSource>) {
         self.references = references;
     }
@@ -228,7 +230,14 @@ impl Terminal {
             color,
         )?;
         loop {
-            let key = match read_byte_or_notice(wake_fd)? {
+            // While status lines are shown, wake up regularly so they can
+            // animate even when no update arrives.
+            let timeout = if statuses.is_empty() {
+                -1
+            } else {
+                STATUS_TICK_MS
+            };
+            let key = match read_byte_or_notice(wake_fd, timeout)? {
                 Some(key) => key,
                 None => {
                     let (updates, new_statuses) = notices(&bytes);
@@ -645,7 +654,15 @@ fn read_byte_timeout(timeout_ms: i32) -> io::Result<Option<u8>> {
     read_byte()
 }
 
-fn read_byte_or_notice(wake_fd: RawFd) -> io::Result<Option<u8>> {
+/// How often the editor rechecks status lines while any are shown, so
+/// activity indicators on them can move.
+pub const STATUS_TICK: std::time::Duration =
+    std::time::Duration::from_millis(STATUS_TICK_MS as u64);
+const STATUS_TICK_MS: i32 = 350;
+
+/// Waits for a key or a wake-up. Returns `None` for a wake-up, or when
+/// `timeout_ms` (if not -1) passes with neither.
+fn read_byte_or_notice(wake_fd: RawFd, timeout_ms: i32) -> io::Result<Option<u8>> {
     let mut fds = [
         libc::pollfd {
             fd: 0,
@@ -658,7 +675,10 @@ fn read_byte_or_notice(wake_fd: RawFd) -> io::Result<Option<u8>> {
             revents: 0,
         },
     ];
-    let ready = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, -1) };
+    let ready = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, timeout_ms) };
+    if ready == 0 {
+        return Ok(None);
+    }
     if ready < 0 {
         let error = io::Error::last_os_error();
         return if error.kind() == io::ErrorKind::Interrupted {
@@ -1033,9 +1053,16 @@ fn write_input_parts(
 }
 
 const REFERENCE_ANSI: &str = "\x1b[1;36m";
+/// Typed references to numbers the session does not have, matching unknown commands.
+const UNKNOWN_REFERENCE_ANSI: &str = "\x1b[1;31m";
 
-/// The colour for a reference: its source's selector colour, or cyan when unknown.
-fn reference_ansi(token: &str, references: &HashMap<usize, ReferenceSource>) -> &'static str {
+/// The colour for a reference: its source's selector colour, red when a typed
+/// reference names no entry, or cyan in help examples, which have no session.
+fn reference_ansi(
+    token: &str,
+    style: InputStyle,
+    references: &HashMap<usize, ReferenceSource>,
+) -> &'static str {
     let id = crate::session::watch_revision_reference(token)
         .map(|(id, _)| id)
         .or_else(|| crate::session::agent_reference(token).map(|(_, _, id)| id))
@@ -1045,7 +1072,11 @@ fn reference_ansi(token: &str, references: &HashMap<usize, ReferenceSource>) -> 
         Some(ReferenceSource::ReadWriteAgent) => SelectorKind::ReadWriteAgent.ansi(),
         Some(ReferenceSource::Reader) => SelectorKind::ReaderShell.ansi(),
         Some(ReferenceSource::Note) => NOTE_REFERENCE_ANSI,
-        None => REFERENCE_ANSI,
+        Some(ReferenceSource::Plain) => REFERENCE_ANSI,
+        None => match style {
+            InputStyle::Entered => UNKNOWN_REFERENCE_ANSI,
+            InputStyle::Example => REFERENCE_ANSI,
+        },
     }
 }
 
@@ -1064,7 +1095,7 @@ fn write_references(
             continue;
         }
         let end = start + token.len();
-        let ansi = reference_ansi(token, references);
+        let ansi = reference_ansi(token, style, references);
         write!(output, "{}{ansi}{token}\x1b[0m", &text[written..start])?;
         if matches!(style, InputStyle::Entered) {
             output.write_all(b"\x1b[1m")?;
@@ -1951,10 +1982,11 @@ mod tests {
         write_entered_input(&mut output, "yes!", true).unwrap();
         assert_eq!(output, b"\x1b[1m\x1b[1;35myes!\x1b[0m\x1b[1m\x1b[0m");
         output.clear();
+        // With no session entries, `#3` is unknown and red.
         write_entered_input(&mut output, "yes! #3", true).unwrap();
         assert_eq!(
             output,
-            b"\x1b[1m\x1b[1;35myes!\x1b[0m\x1b[1m \x1b[1;36m#3\x1b[0m\x1b[1m\x1b[0m"
+            b"\x1b[1m\x1b[1;35myes!\x1b[0m\x1b[1m \x1b[1;31m#3\x1b[0m\x1b[1m\x1b[0m"
         );
         output.clear();
         write_input(&mut output, "yes", true).unwrap();
@@ -2007,6 +2039,28 @@ mod tests {
             "\x1b[1;32mopus?\x1b[0m compare \x1b[1;32m#3\x1b[0m, \x1b[1;32mopus?#3\x1b[0m, \
              \x1b[1;35m#6\x1b[0m, \x1b[1;32m#4\x1b[0m and \x1b[1;32m#4.2\x1b[0m with \
              \x1b[1;36m#5\x1b[0m per \x1b[1;90m#7\x1b[0m"
+        );
+    }
+
+    #[test]
+    fn typed_unknown_references_are_red() {
+        let references = HashMap::from([
+            (3, ReferenceSource::ReadOnlyAgent),
+            (8, ReferenceSource::Plain),
+        ]);
+        let mut output = Vec::new();
+        write_input_style(
+            &mut output,
+            "opus? compare #3, #8 and #5",
+            true,
+            InputStyle::Entered,
+            &references,
+        )
+        .unwrap();
+        assert_eq!(
+            String::from_utf8(output).unwrap(),
+            "\x1b[1m\x1b[1;32mopus?\x1b[0m\x1b[1m compare \x1b[1;32m#3\x1b[0m\x1b[1m, \
+             \x1b[1;36m#8\x1b[0m\x1b[1m and \x1b[1;31m#5\x1b[0m\x1b[1m\x1b[0m"
         );
     }
 
