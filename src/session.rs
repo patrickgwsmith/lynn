@@ -140,12 +140,14 @@ pub enum AgentModel {
     Sonnet,
     Haiku,
     Codex,
+    Astra,
     Sol,
     Luna,
     Terra,
     Pi,
     Fx,
     Agy,
+    Neon,
     Flash,
     Jsc,
 }
@@ -160,12 +162,14 @@ impl AgentModel {
             "sonnet" => Some(Self::Sonnet),
             "haiku" => Some(Self::Haiku),
             "codex" => Some(Self::Codex),
+            "astra" => Some(Self::Astra),
             "sol" => Some(Self::Sol),
             "luna" => Some(Self::Luna),
             "terra" => Some(Self::Terra),
             "pi" => Some(Self::Pi),
             "fx" => Some(Self::Fx),
             "agy" | "antigravity" => Some(Self::Agy),
+            "neon" => Some(Self::Neon),
             "flash" => Some(Self::Flash),
             "jsc" if cfg!(target_os = "macos") => Some(Self::Jsc),
             _ => None,
@@ -181,12 +185,14 @@ impl AgentModel {
             Self::Sonnet => "sonnet",
             Self::Haiku => "haiku",
             Self::Codex => "codex",
+            Self::Astra => "astra",
             Self::Sol => "sol",
             Self::Luna => "luna",
             Self::Terra => "terra",
             Self::Pi => "pi",
             Self::Fx => "fx",
             Self::Agy => "agy",
+            Self::Neon => "neon",
             Self::Flash => "flash",
             Self::Jsc => "jsc",
         }
@@ -197,9 +203,11 @@ impl AgentModel {
         match self {
             Self::Fable | Self::Opus | Self::Sonnet | Self::Haiku => Some(self.name()),
             Self::Sol => Some("gpt-6-sol"),
+            Self::Astra => Some("gpt-6.2-astra"),
             Self::Luna => Some("gpt-6-luna"),
             Self::Terra => Some("gpt-5.6-terra"),
             Self::Flash => Some("gemini-3.8-flash-high"),
+            Self::Neon => Some("gemini-4-neon"),
             Self::Fm | Self::Claude | Self::Codex | Self::Pi | Self::Fx | Self::Agy | Self::Jsc => {
                 None
             }
@@ -619,6 +627,7 @@ fn live_agent_request(line: &str) -> Option<(AgentModel, &str)> {
             | AgentModel::Sonnet
             | AgentModel::Haiku
             | AgentModel::Codex
+            | AgentModel::Astra
             | AgentModel::Sol
             | AgentModel::Luna
             | AgentModel::Terra
@@ -1198,7 +1207,7 @@ mod tests {
 
     #[test]
     fn codex_model_aliases_are_agent_requests() {
-        for name in ["sol", "luna", "terra"] {
+        for name in ["astra", "sol", "luna", "terra", "neon"] {
             let model = AgentModel::parse(name).unwrap();
             assert_eq!(
                 request(&format!("{name}? inspect this")),
@@ -1209,6 +1218,8 @@ mod tests {
                 expected("fix this", &[model], read_write())
             );
         }
+        assert_eq!(AgentModel::Astra.backend_model(), Some("gpt-6.2-astra"));
+        assert_eq!(AgentModel::Neon.backend_model(), Some("gemini-4-neon"));
     }
 
     #[test]

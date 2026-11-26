@@ -1456,16 +1456,16 @@ fn completions_in(line: &str, cursor: usize, cwd: &Path) -> Completion {
         let built_ins: &[&str] = if staffer_agent {
             &[
                 "claude?", "claude!", "opus?", "opus!", "sonnet?", "sonnet!", "codex?", "codex!",
-                "Opus?", "Opus!", "sol?", "sol!", "luna?", "luna!", "terra?", "terra!", "pi?",
-                "pi!", "agy?", "agy!", "flash?", "flash!",
+                "Opus?", "Opus!", "astra?", "astra!", "sol?", "sol!", "luna?", "luna!", "terra?",
+                "terra!", "pi?", "pi!", "agy?", "agy!", "neon?", "neon!", "flash?", "flash!",
             ]
         } else {
             &[
                 "cd", "exit", "export", "unset", "reset", "bash!", "zsh!", "bash?", "zsh?",
                 "@staffer", "fm?", "fm!", "claude?", "claude!", "opus?", "opus!", "sonnet?",
-                "Opus?", "Opus!", "sonnet!", "codex?", "codex!", "sol?", "sol!", "luna?", "luna!",
-                "terra?", "terra!", "pi?", "pi!", "agy?", "agy!", "flash?", "flash!", "🎵", "🎶",
-                "☀️", "🌙", "🥧", "🍎",
+                "Opus?", "Opus!", "sonnet!", "codex?", "codex!", "astra?", "astra!", "sol?",
+                "sol!", "luna?", "luna!", "terra?", "terra!", "pi?", "pi!", "agy?", "agy!",
+                "neon?", "neon!", "flash?", "flash!", "🎵", "🎶", "☀️", "🌙", "🥧", "🍎",
             ]
         };
         for built_in in built_ins {
@@ -1482,8 +1482,8 @@ fn completions_in(line: &str, cursor: usize, cwd: &Path) -> Completion {
             }
         }
         for model in [
-            "claude", "fable", "opus", "Opus", "sonnet", "haiku", "codex", "sol", "luna", "terra",
-            "agy", "flash",
+            "claude", "fable", "opus", "Opus", "sonnet", "haiku", "codex", "astra", "sol", "luna",
+            "terra", "agy", "neon", "flash",
         ] {
             for suffix in ["??", "???", "!!", "!!!"] {
                 let selector = format!("{model}{suffix}");

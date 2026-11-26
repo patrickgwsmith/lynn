@@ -1423,24 +1423,35 @@ fn run_agent(
             AgentOutput::Live,
         ) => claude::run_live(request, progress),
         (
-            AgentModel::Codex | AgentModel::Sol | AgentModel::Luna | AgentModel::Terra,
+            AgentModel::Codex
+            | AgentModel::Astra
+            | AgentModel::Sol
+            | AgentModel::Luna
+            | AgentModel::Terra,
             AgentOutput::Final,
         ) => codex::run(request),
         (
-            AgentModel::Codex | AgentModel::Sol | AgentModel::Luna | AgentModel::Terra,
+            AgentModel::Codex
+            | AgentModel::Astra
+            | AgentModel::Sol
+            | AgentModel::Luna
+            | AgentModel::Terra,
             AgentOutput::Live,
         ) => codex::run_live(request, progress),
         (AgentModel::Pi, AgentOutput::Final) => {
             pi::run(task, cwd, context, backend_model, access, user)
         }
         (AgentModel::Fx, AgentOutput::Final) => fx::run(request),
-        (AgentModel::Agy | AgentModel::Flash, AgentOutput::Final) => agy::run(request),
+        (AgentModel::Agy | AgentModel::Neon | AgentModel::Flash, AgentOutput::Final) => {
+            agy::run(request)
+        }
         (AgentModel::Jsc, AgentOutput::Final) => jsc::run(task, cwd, access, user).map(Into::into),
         (
             AgentModel::Fm
             | AgentModel::Pi
             | AgentModel::Fx
             | AgentModel::Agy
+            | AgentModel::Neon
             | AgentModel::Flash
             | AgentModel::Jsc,
             AgentOutput::Live,
@@ -1462,10 +1473,12 @@ fn interactive_agent(
         | AgentModel::Opus
         | AgentModel::Sonnet
         | AgentModel::Haiku => claude::interactive(cwd, model.backend_model(), access, effort),
-        AgentModel::Codex | AgentModel::Sol | AgentModel::Luna | AgentModel::Terra => {
-            codex::interactive(cwd, model.backend_model(), access, effort)
-        }
-        AgentModel::Agy | AgentModel::Flash => {
+        AgentModel::Codex
+        | AgentModel::Astra
+        | AgentModel::Sol
+        | AgentModel::Luna
+        | AgentModel::Terra => codex::interactive(cwd, model.backend_model(), access, effort),
+        AgentModel::Agy | AgentModel::Neon | AgentModel::Flash => {
             agy::interactive(cwd, model.backend_model(), access, effort)
         }
         AgentModel::Pi if effort == ReasoningEffort::Default => {

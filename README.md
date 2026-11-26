@@ -61,10 +61,10 @@ Lynn supports these agent names:
 | Name | Agent |
 | --- | --- |
 | `claude`, `fable`, `opus`, `sonnet`, `haiku` | Claude Code |
-| `codex`, `sol`, `luna`, `terra` | Codex |
+| `codex`, `astra`, `sol`, `luna`, `terra` | Codex (`astra` selects `gpt-6.2-astra`) |
 | `pi` | Pi |
 | `fx` | fx (`fx?` requires macOS) |
-| `agy`, `antigravity`, `flash` | Antigravity CLI |
+| `agy`, `antigravity`, `neon`, `flash` | Antigravity CLI (`neon` selects `gemini-4-neon`) |
 | `fm` | Apple Foundation Models (macOS only) |
 | `jsc` | JavaScriptCore shell (macOS only) |
 
