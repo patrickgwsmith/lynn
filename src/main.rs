@@ -12,6 +12,7 @@ mod jsc;
 mod live;
 mod login_path;
 mod pi;
+mod program_status;
 mod session;
 mod shell;
 mod terminal;
@@ -496,6 +497,48 @@ fn request_input(session: &Session, id: usize) -> Option<&str> {
     })
 }
 
+/// Lynn's records for the terminal's program status: one per pending
+/// request, beneath Lynn's own, which sums them up or says how the last agent
+/// request finished.
+fn program_status_records(session: &Session, workers: &Workers) -> program_status::Records {
+    use program_status::{Record, Records, State, ROOT_ID};
+    let mut records = Records::new();
+    let mut pending = Vec::new();
+    for (&id, status) in &workers.pending_agents {
+        let label = status.split(':').next().unwrap_or(status);
+        let text = workers
+            .pending_prompts
+            .get(&id)
+            .and_then(|prompt| prompt.summary.as_deref())
+            .or_else(|| request_input(session, id))
+            .unwrap_or(status);
+        records.insert(
+            format!("{ROOT_ID}/r{id}"),
+            Record::new(State::Working).title(label).msg(text),
+        );
+        pending.push(format!("{label}: {text}"));
+    }
+    for (&id, status) in &workers.pending_http {
+        let text = status.strip_suffix(": …").unwrap_or(status);
+        records.insert(
+            format!("{ROOT_ID}/h{id}"),
+            Record::new(State::Working).msg(text),
+        );
+        pending.push(text.to_owned());
+    }
+    let lynn = match pending.as_slice() {
+        [] => match &workers.unseen_outcome {
+            Some(outcome) if outcome.failed => Record::new(State::Error).msg(&outcome.msg),
+            Some(outcome) => Record::new(State::Done).msg(&outcome.msg),
+            None => Record::new(State::Idle),
+        },
+        [only] => Record::new(State::Working).msg(only.as_str()),
+        all => Record::new(State::Working).msg(format!("{} requests pending", all.len())),
+    };
+    records.insert(ROOT_ID.into(), lynn);
+    records
+}
+
 fn request_sent_at(session: &Session, id: usize) -> Option<Instant> {
     session.events.iter().find_map(|event| match event {
         Event::AgentRequest {
@@ -653,6 +696,12 @@ enum WorkerUpdate {
 /// normally ready by then.
 const PROMPT_REVEAL_DELAY: Duration = Duration::from_secs(5);
 
+/// How an agent request finished, for the terminal's program status.
+struct AgentOutcome {
+    failed: bool,
+    msg: String,
+}
+
 /// The prompt line for a running or queued `!` request, shown once it has
 /// been pending for [`PROMPT_REVEAL_DELAY`].
 #[derive(Default)]
@@ -686,6 +735,10 @@ struct Workers {
     queued_agents: BTreeMap<usize, QueuedAgent>,
     /// Set while the input line starts with `#`, so queued agents wait for the note.
     holding_for_note: bool,
+    /// How the last agent request finished, until you enter a line, so the
+    /// terminal can show that a reply is waiting. A failure is kept over a
+    /// later success.
+    unseen_outcome: Option<AgentOutcome>,
     interactive: bool,
     next_http_id: usize,
     active_http: usize,
@@ -749,6 +802,7 @@ impl Workers {
             loading_urls: BTreeMap::new(),
             queued_agents: BTreeMap::new(),
             holding_for_note: false,
+            unseen_outcome: None,
             interactive,
             next_http_id: 1,
             active_http: 0,
@@ -785,6 +839,9 @@ fn main() {
     let output_is_terminal = unsafe { libc::isatty(1) == 1 };
     let mut terminal = terminal::Terminal::new();
     let mut workers = Workers::new(interactive);
+    let mut program_status = program_status::Reporter::new(
+        output_is_terminal && std::env::var("TERM").ok().as_deref() != Some("dumb"),
+    );
     if interactive {
         if output_is_terminal {
             if let Err(error) = terminal::clear_screen() {
@@ -802,6 +859,10 @@ fn main() {
                     break;
                 }
             }
+            // Program status is best effort: a terminal that can't take it
+            // ignores it, and a broken stdout shows up through the title.
+            let _ = program_status.prompt_start();
+            let _ = program_status.sync(program_status_records(&session, &workers));
             let color = output_color();
             let short_prompt = prompt(session.mode, &session.cwd, false, color);
             let full_prompt = prompt(session.mode, &session.cwd, true, color);
@@ -822,12 +883,14 @@ fn main() {
                 |line| {
                     set_note_hold(&session, &mut workers, line.starts_with(b"#"));
                     let updates = drain_updates(&mut workers, &mut session);
+                    let _ = program_status.sync(program_status_records(&session, &workers));
                     let statuses = pending_agent_statuses(&session, &workers, color);
                     (updates, statuses)
                 },
             ) {
                 Ok(ReadResult::Line(line)) => {
                     session.detail = DisplayDetail::Compact;
+                    workers.unseen_outcome = None;
                     line
                 }
                 Ok(ReadResult::Interrupt) => {
@@ -839,6 +902,7 @@ fn main() {
                 Ok(ReadResult::Eof) => break,
                 Ok(ReadResult::Expand) => {
                     session.detail = DisplayDetail::Expanded;
+                    workers.unseen_outcome = None;
                     set_note_hold(&session, &mut workers, false);
                     for result in expanded_agent_results(&mut session) {
                         println!("{result}");
@@ -851,11 +915,13 @@ fn main() {
                 }
             };
             if let Some(status) = handle(&line, &mut session, &mut workers, &mut terminal) {
+                let _ = program_status.clear();
                 std::process::exit(status);
             }
             // The note (if any) is now recorded, so queued agents can see it.
             set_note_hold(&session, &mut workers, false);
         }
+        let _ = program_status.clear();
     } else {
         for line in io::stdin().lock().lines() {
             match line {
@@ -3118,6 +3184,8 @@ fn format_update(update: AgentUpdate, session: &mut Session, workers: &mut Worke
         workers.running_writer = None;
     }
     let label = AgentLabel::new(&update.model, update.access, update.id).in_session(session);
+    let failed = update.result.is_err();
+    let label_text = label.to_string();
     let line = match update.result {
         Ok(reply) => {
             let display = match update.access {
@@ -3136,6 +3204,21 @@ fn format_update(update: AgentUpdate, session: &mut Session, workers: &mut Worke
         }
         Err(error) => render_agent(label, AgentDisplay::Error(&error), Styling::Terminal),
     };
+    if !workers
+        .unseen_outcome
+        .as_ref()
+        .is_some_and(|outcome| outcome.failed)
+        || failed
+    {
+        workers.unseen_outcome = Some(AgentOutcome {
+            failed,
+            msg: if failed {
+                format!("{label_text} failed")
+            } else {
+                format!("{label_text} replied")
+            },
+        });
+    }
     resume_queued_agents(session, workers);
     line
 }
@@ -5067,5 +5150,58 @@ mod tests {
         assert!(excerpt.ends_with("\nend"));
         assert!(excerpt.contains(&format!("{} bytes total", output.len())));
         assert_eq!(super::watch_context_excerpt(&output, output.len()), output);
+    }
+
+    #[test]
+    fn program_status_reports_pending_requests_then_how_they_finished() {
+        use crate::program_status::{Record, State};
+        let mut session = Session::new().unwrap();
+        let mut workers = Workers::new(false);
+        session.events.push(Event::AgentRequest {
+            sent_at: Instant::now(),
+            id: 4,
+            input: "fix\nthe parser".into(),
+            access: AgentAccess::ReadWrite,
+            user: AgentUser::Current,
+            model: Some("opus".into()),
+            effort: ReasoningEffort::Default,
+            output: AgentOutput::Final,
+            pi_model: None,
+        });
+        let idle = super::program_status_records(&session, &workers);
+        assert_eq!(idle.len(), 1);
+        assert_eq!(idle["lynn"], Record::new(State::Idle));
+
+        workers.pending_agents.insert(4, "opus!#4: …".into());
+        workers.active_agents = 1;
+        let working = super::program_status_records(&session, &workers);
+        assert_eq!(
+            working["lynn/r4"],
+            Record::new(State::Working)
+                .title("opus!#4")
+                .msg("fix\nthe parser")
+        );
+        assert_eq!(
+            working["lynn"],
+            Record::new(State::Working).msg("opus!#4: fix\nthe parser")
+        );
+
+        format_update(
+            AgentUpdate {
+                elapsed: Duration::ZERO,
+                id: 4,
+                model: "opus".into(),
+                access: AgentAccess::ReadWrite,
+                result: Err("failed".into()),
+            },
+            &mut session,
+            &mut workers,
+        );
+        let failed = super::program_status_records(&session, &workers);
+        assert_eq!(failed.len(), 1);
+        assert_eq!(
+            failed["lynn"],
+            Record::new(State::Error).msg("opus!#4 failed")
+        );
     }
 }
