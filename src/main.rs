@@ -3184,7 +3184,16 @@ fn format_update(update: AgentUpdate, session: &mut Session, workers: &mut Worke
         workers.running_writer = None;
     }
     let label = AgentLabel::new(&update.model, update.access, update.id).in_session(session);
-    let failed = update.result.is_err();
+    // The first line of an error says why, which fits a terminal's status.
+    let failure = update.result.as_ref().err().map(|error| {
+        error
+            .lines()
+            .map(str::trim)
+            .find(|line| !line.is_empty())
+            .unwrap_or("")
+            .to_owned()
+    });
+    let failed = failure.is_some();
     let label_text = label.to_string();
     let line = match update.result {
         Ok(reply) => {
@@ -3212,10 +3221,10 @@ fn format_update(update: AgentUpdate, session: &mut Session, workers: &mut Worke
     {
         workers.unseen_outcome = Some(AgentOutcome {
             failed,
-            msg: if failed {
-                format!("{label_text} failed")
-            } else {
-                format!("{label_text} replied")
+            msg: match &failure {
+                Some(reason) if !reason.is_empty() => format!("{label_text} failed: {reason}"),
+                Some(_) => format!("{label_text} failed"),
+                None => format!("{label_text} replied"),
             },
         });
     }
@@ -5201,7 +5210,7 @@ mod tests {
         assert_eq!(failed.len(), 1);
         assert_eq!(
             failed["lynn"],
-            Record::new(State::Error).msg("opus!#4 failed")
+            Record::new(State::Error).msg("opus!#4 failed: failed")
         );
     }
 }
